@@ -37,6 +37,12 @@ from tools.tenki_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# (endpoint, image) pairs whose creates were rejected with "wait_for_runtime
+# requires a template runtime". Process-wide so each new environment for the
+# same image skips the guaranteed-failing first attempt, not just later
+# creates on the same instance.
+_RUNTIME_WAIT_UNSUPPORTED_IMAGES: set[str] = set()
 _SNAPSHOT_NAMESPACE = "direct"
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -314,6 +320,9 @@ class TenkiEnvironment(BaseEnvironment):
         self._Client = Client
         self._Sandbox = Sandbox
         self._client = None
+        self._client_create_sig: inspect.Signature | None = None
+        self._client_create_sig_resolved = False
+        self._runtime_wait_unsupported = False
         self._sandbox = None
         self._lock = threading.Lock()
         self._persistent = persistent_filesystem
@@ -339,6 +348,9 @@ class TenkiEnvironment(BaseEnvironment):
         self._workspace_id = resolve_tenki_workspace_id(workspace_id)
         self._project_id = resolve_tenki_project_id(project_id)
         self._auth_token = resolve_tenki_auth_token()
+        self._runtime_wait_unsupported = (
+            self._runtime_wait_cache_key() in _RUNTIME_WAIT_UNSUPPORTED_IMAGES
+        )
         self._name_prefix = _safe_name(name_prefix, fallback="hermes", max_len=28)
         self._allow_inbound = allow_inbound
         self._allow_outbound = allow_outbound
@@ -370,6 +382,16 @@ class TenkiEnvironment(BaseEnvironment):
             return inspect.signature(self._Sandbox.create)
         except (TypeError, ValueError):
             return None
+
+    def _client_create_signature(self) -> inspect.Signature | None:
+        # Cached: _create_kwargs runs twice on the snapshot-fallback path.
+        if not self._client_create_sig_resolved:
+            try:
+                self._client_create_sig = inspect.signature(self._Client.create)
+            except (TypeError, ValueError):
+                self._client_create_sig = None
+            self._client_create_sig_resolved = True
+        return self._client_create_sig
 
     def _create_kwargs(self) -> dict[str, Any]:
         sig = self._sandbox_create_signature()
@@ -416,12 +438,25 @@ class TenkiEnvironment(BaseEnvironment):
         )
         _add_supported(kwargs, sig, ("tags",), ["hermes-agent"])
         _add_supported(kwargs, sig, ("wait",), True)
+        # ``wait`` only reaches RUNNING; ``wait_for_runtime`` (tenki-sandbox
+        # >= 0.4.0) additionally holds the create RPC until the image's declared
+        # runtime (entrypoint / ready_when probes) is up, so the first exec
+        # cannot race a half-booted guest. It does not imply ``wait`` (they are
+        # independent request fields and nothing polls the runtime client-side),
+        # so ``wait=True`` above stays. Gate on Client.create, NOT
+        # Sandbox.create: the latter is ``(cls, **kwargs)``, so _add_supported's
+        # VAR_KEYWORD fallback would emit the kwarg unconditionally and an older
+        # Client.create — which both create paths funnel into — would raise
+        # TypeError.
+        _add_supported(kwargs, self._client_create_signature(), ("wait_for_runtime",), True)
         # Do NOT emit a create-time ``timeout`` here: the SDK's Sandbox.create
         # pops ``timeout`` into the *Client* (HTTP) timeout, while Client.create
         # treats ``timeout`` as the *wait-for-ready* budget — so the same value
         # would mean two different things across the two create paths. The HTTP
-        # timeout is set explicitly in _create_client(); readiness uses the
-        # SDK's default wait budget.
+        # timeout is set explicitly in _create_client() and must cover the
+        # server-held create (boot *and* runtime start now that
+        # ``wait_for_runtime`` is requested); readiness itself uses the SDK's
+        # default wait budget.
         return kwargs
 
     def _sandbox_env(self) -> dict[str, str]:
@@ -506,10 +541,15 @@ class TenkiEnvironment(BaseEnvironment):
 
     def _create_client(self):
         if self._client is None:
+            # CreateSession is a unary RPC, so this client-wide timeout is its
+            # gRPC deadline — and the server now holds that single call through
+            # boot *and* runtime start (``wait_for_runtime``, see
+            # _create_kwargs). 60s would make DEADLINE_EXCEEDED routine, so the
+            # floor matches the SDK's own 180s wait budget.
             self._client = self._Client(
                 auth_token=self._auth_token,
                 base_url=self._api_endpoint,
-                timeout=max(60, self.timeout),
+                timeout=max(180, self.timeout),
             )
         return self._client
 
@@ -641,13 +681,77 @@ class TenkiEnvironment(BaseEnvironment):
             raise RuntimeError("Tenki sandbox was torn down mid-operation")
         return sandbox
 
+    @staticmethod
+    def _is_runtime_wait_unsupported_error(exc: BaseException) -> bool:
+        """True when the server rejected the create because the image declares
+        no template runtime for ``wait_for_runtime`` to wait on (verified live:
+        ``SandboxError: wait_for_runtime requires a template runtime``).
+        Matched on the message rather than the type — it arrives as a generic
+        ``SandboxError``, indistinguishable by class from other failures."""
+        return "requires a template runtime" in str(exc).lower()
+
     def _create_sandbox_from_kwargs(self, kwargs: dict[str, Any]):
+        # ``wait_for_runtime`` is requested optimistically and withdrawn on the
+        # two failure modes the gate can introduce:
+        # - "requires a template runtime": the image declares no runtime (the
+        #   Tenki default image, any plain image) and the server rejects the
+        #   whole create. Latched — every later create for this image skips the
+        #   doomed attempt.
+        # - TemplateRuntimeFailedError: the runtime exists but failed to start.
+        #   Retried once without the gate (matching pre-gate behavior, where
+        #   the sandbox booted and a broken runtime surfaced at first exec);
+        #   NOT latched, so the next construction gets determinism back.
+        # Either way the failed attempt may have left a live sandbox behind —
+        # reap it before retrying under the same deterministic name.
+        if self._runtime_wait_unsupported:
+            kwargs = {k: v for k, v in kwargs.items() if k != "wait_for_runtime"}
+        try:
+            return self._create_sandbox_from_kwargs_once(kwargs)
+        except Exception as exc:
+            if "wait_for_runtime" not in kwargs:
+                raise
+            unsupported = self._is_runtime_wait_unsupported_error(exc)
+            runtime_failed = any(
+                typ.__name__ == "TemplateRuntimeFailedError" for typ in type(exc).__mro__
+            )
+            if not unsupported and not runtime_failed:
+                raise
+            self._terminate_runtime_failure_sandbox(exc)
+            if unsupported:
+                self._mark_runtime_wait_unsupported()
+                logger.info(
+                    "Tenki: image declares no template runtime; retrying create "
+                    "without wait_for_runtime"
+                )
+            else:
+                logger.warning(
+                    "Tenki: template runtime failed to start; retrying create "
+                    "without the runtime gate"
+                )
+            kwargs = {k: v for k, v in kwargs.items() if k != "wait_for_runtime"}
+            return self._create_sandbox_from_kwargs_once(kwargs)
+
+    def _runtime_wait_cache_key(self) -> str:
+        return f"{self._api_endpoint}|{self._image or ''}"
+
+    def _mark_runtime_wait_unsupported(self) -> None:
+        self._runtime_wait_unsupported = True
+        _RUNTIME_WAIT_UNSUPPORTED_IMAGES.add(self._runtime_wait_cache_key())
+
+    def _create_sandbox_from_kwargs_once(self, kwargs: dict[str, Any]):
         if self._persistent:
             client = self._create_client()
             create_kwargs = dict(kwargs)
             for key in ("auth_token", "api_key", "base_url", "api_endpoint"):
                 create_kwargs.pop(key, None)
             return client.create(**create_kwargs)
+        # On this path ``timeout`` is NOT the wait budget: Sandbox.create pops
+        # it into the Client it builds internally, making it that client's gRPC
+        # deadline. Without it the ephemeral create runs with no deadline at
+        # all — an unbounded server-held call now that wait_for_runtime extends
+        # the hold. Mirrors the persistent path's _create_client() deadline.
+        kwargs = dict(kwargs)
+        kwargs.setdefault("timeout", max(180, self.timeout))
         return self._Sandbox.create(**kwargs)
 
     # Snapshot errors that mean the recorded snapshot can never restore, so
@@ -724,11 +828,67 @@ class TenkiEnvironment(BaseEnvironment):
                 return True
         return _is_snapshot_specific_invalid_state(exc, None)
 
+    def _terminate_runtime_failure_sandbox(self, exc: BaseException) -> None:
+        """Reap the sandbox a failed ``wait_for_runtime`` left running.
+
+        The SDK reports a template runtime failure as TemplateRuntimeFailedError
+        *without* terminating the sandbox, so the guest would keep running (and
+        billing) until ``max_duration`` unless it is terminated here. The type is
+        matched by name because SDKs older than 0.4.0 do not export it. This is
+        best-effort only: it must never mask the original create failure, and it
+        deliberately does not touch the snapshot pointer (a runtime failure is
+        transient, so _snapshot_unrecoverable keeps the pointer).
+        """
+        if not any(typ.__name__ == "TemplateRuntimeFailedError" for typ in type(exc).__mro__):
+            return
+        # Both the retry wrapper and the snapshot-fallback path reap; one
+        # attempt per exception is enough (and keeps a failing terminate from
+        # being hammered twice).
+        if getattr(exc, "_hermes_reap_attempted", False):
+            return
+        try:
+            exc._hermes_reap_attempted = True
+        except Exception:
+            pass
+        info = getattr(exc, "sandbox", None)
+        if info is None:
+            # Message-only failure (no proto detail): nothing to reap, but the
+            # sandbox may still be running server-side — leave a trace.
+            logger.debug(
+                "Tenki: runtime-wait failure carried no sandbox handle; "
+                "nothing to reap (%s)", exc,
+            )
+            return
+        sandbox_id = getattr(info, "id", None) or getattr(info, "sandbox_id", None)
+        try:
+            handle = info
+            if not callable(getattr(handle, "terminate", None)) and sandbox_id:
+                # 0.4.0 attaches a data-only SandboxInfo, so a live handle has
+                # to be resolved before the sandbox can be terminated.
+                handle = self._create_client().get(sandbox_id)
+            terminate = getattr(handle, "terminate", None) or getattr(handle, "close", None)
+            if not callable(terminate):
+                raise RuntimeError("sandbox handle exposes no terminate()")
+            terminate()
+        except Exception as reap_exc:
+            logger.warning(
+                "Tenki: sandbox %s left running by a failed runtime wait could not be "
+                "terminated: %s",
+                sandbox_id or "<unknown>",
+                reap_exc,
+            )
+            return
+        logger.warning(
+            "Tenki: terminated sandbox %s left running by a failed runtime wait",
+            sandbox_id or "<unknown>",
+        )
+
     def _create_sandbox_with_snapshot_fallback(self):
         kwargs = self._create_kwargs()
         try:
             sandbox = self._create_sandbox_from_kwargs(kwargs)
         except Exception as exc:
+            self._terminate_runtime_failure_sandbox(exc)
             if not self._snapshot_restore_id:
                 raise
             if not self._snapshot_unrecoverable(exc):
@@ -752,7 +912,11 @@ class TenkiEnvironment(BaseEnvironment):
             _delete_snapshot(self._task_id, self._snapshot_restore_id, self._snapshot_store)
             self._snapshot_restore_id = None
             self._snapshot_restore_from_legacy_key = False
-            sandbox = self._create_sandbox_from_kwargs(self._create_kwargs())
+            try:
+                sandbox = self._create_sandbox_from_kwargs(self._create_kwargs())
+            except Exception as retry_exc:
+                self._terminate_runtime_failure_sandbox(retry_exc)
+                raise
         else:
             if self._snapshot_restore_id and self._snapshot_restore_from_legacy_key:
                 _store_snapshot(self._task_id, self._snapshot_restore_id, self._snapshot_store)
