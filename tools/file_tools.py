@@ -167,6 +167,23 @@ _TERMINAL_CWD_SENTINELS = frozenset({"", ".", "./", "auto", "cwd"})
 _CONTAINER_PATH_BACKENDS_FALLBACK = frozenset({"docker", "singularity", "modal", "daytona"})
 
 
+def _env_cache_keys_for(task_id: str) -> tuple[str, str]:
+    """Return ``(container key, raw-task key)`` for the ACTIVE profile.
+
+    Both are terminal_tool composite keys ("<profile token>\\x00<id>"). The raw
+    variant preserves the historical fallback to an env cached under the
+    originating session id, but profile-scoped — an un-prefixed lookup would
+    reopen the cross-profile hole this keying exists to close. Falls back to the
+    bare ids only if terminal_tool is unimportable.
+    """
+    try:
+        from tools.terminal_tool import _env_cache_key, _scoped_cache_key
+
+        return _env_cache_key(task_id), _scoped_cache_key(task_id)
+    except Exception:
+        return task_id, task_id
+
+
 def _terminal_env_type_for_task(task_id: str = "default") -> str:
     """Best-effort terminal backend type for path-resolution decisions."""
     try:
@@ -174,15 +191,11 @@ def _terminal_env_type_for_task(task_id: str = "default") -> str:
             _active_environments,
             _env_lock,
             _get_env_config,
-            _resolve_container_task_id,
         )
 
-        try:
-            container_key = _resolve_container_task_id(task_id)
-        except Exception:
-            container_key = task_id
+        container_key, raw_key = _env_cache_keys_for(task_id)
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key) or _active_environments.get(raw_key)
         if env is not None:
             name = env.__class__.__name__.lower()
             if "local" in name:
@@ -295,14 +308,10 @@ def _live_cwd_if_owned(env, task_id: str) -> str | None:
 
 def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
     """Return the task's live terminal cwd for bookkeeping when available."""
-    try:
-        from tools.terminal_tool import _resolve_container_task_id
-        container_key = _resolve_container_task_id(task_id)
-    except Exception:
-        container_key = task_id
+    container_key, raw_key = _env_cache_keys_for(task_id)
 
     with _file_ops_lock:
-        cached = _file_ops_cache.get(container_key) or _file_ops_cache.get(task_id)
+        cached = _file_ops_cache.get(container_key) or _file_ops_cache.get(raw_key)
     if cached is not None:
         env = getattr(cached, "env", None)
         live_cwd = _live_cwd_if_owned(env, task_id)
@@ -319,7 +328,7 @@ def _get_live_tracking_cwd(task_id: str = "default") -> str | None:
         from tools.terminal_tool import _active_environments, _env_lock
 
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key) or _active_environments.get(raw_key)
         live_cwd = _live_cwd_if_owned(env, task_id)
         if live_cwd:
             _remember_last_known_cwd(container_key, live_cwd)
@@ -696,16 +705,15 @@ def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | Non
             _active_environments,
             _env_lock,
             _get_env_config,
-            _resolve_container_task_id,
         )
 
-        container_key = _resolve_container_task_id(task_id)
+        container_key, raw_key = _env_cache_keys_for(task_id)
     except Exception:
         return None
 
     try:
         with _env_lock:
-            env = _active_environments.get(container_key) or _active_environments.get(task_id)
+            env = _active_environments.get(container_key) or _active_environments.get(raw_key)
 
         if env is not None:
             if env.__class__.__name__ == "DockerEnvironment" and bool(
@@ -792,6 +800,11 @@ def _is_expected_write_exception(exc: Exception) -> bool:
     return False
 
 
+# Both dicts are keyed by terminal_tool's COMPOSITE cache key
+# ("<profile token>\x00<container id>", see ``_env_cache_key``) so they stay in
+# lockstep with ``_active_environments``. Keying them by the bare container id
+# would hand profile B a ShellFileOperations still bound to profile A's live
+# sandbox even after the terminal cache itself was scoped.
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
 # Per-task last-known CWD — preserved across env re-creation so
@@ -800,8 +813,11 @@ _file_ops_cache: dict = {}
 _last_known_cwd: dict = {}
 
 
-def _remember_last_known_cwd(task_id: str, cwd: str | None) -> None:
+def _remember_last_known_cwd(cache_key: str, cwd: str | None) -> None:
     """Mirror a live terminal cwd into the durable ``_last_known_cwd`` registry.
+
+    *cache_key* is terminal_tool's profile-scoped ``_env_cache_key`` value, the
+    same key ``_get_file_ops`` saves under.
 
     Belt-and-suspenders for #26211: the cleanup thread can pop BOTH
     ``_file_ops_cache`` and ``_active_environments`` before ``_get_file_ops``
@@ -815,24 +831,20 @@ def _remember_last_known_cwd(task_id: str, cwd: str | None) -> None:
     if not cwd:
         return
     with _file_ops_lock:
-        if _last_known_cwd.get(task_id) != cwd:
-            _last_known_cwd[task_id] = cwd
+        if _last_known_cwd.get(cache_key) != cwd:
+            _last_known_cwd[cache_key] = cwd
 
 
 def _last_known_cwd_for(task_id: str = "default") -> str | None:
-    """Read the durable last-known cwd for *task_id*, container-key aware.
+    """Read the durable last-known cwd for *task_id*, cache-key aware.
 
-    The registry is keyed by the resolved container id (the same key used by
-    the save sites in ``_get_file_ops`` / ``_get_live_tracking_cwd``), so look
-    up the resolved key first and fall back to the raw task id.
+    The registry is keyed by the profile-scoped env cache key (the same key
+    used by the save sites in ``_get_file_ops`` / ``_get_live_tracking_cwd``),
+    so look up the container key first and fall back to the raw-task key.
     """
-    try:
-        from tools.terminal_tool import _resolve_container_task_id
-        container_key = _resolve_container_task_id(task_id)
-    except Exception:
-        container_key = task_id
+    container_key, raw_key = _env_cache_keys_for(task_id)
     with _file_ops_lock:
-        return _last_known_cwd.get(container_key) or _last_known_cwd.get(task_id)
+        return _last_known_cwd.get(container_key) or _last_known_cwd.get(raw_key)
 
 # Track files read per task to detect re-read loops and deduplicate reads.
 # Per task_id we store:
@@ -1050,6 +1062,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
         _get_env_config, _last_activity, _start_cleanup_thread,
         _creation_locks,
         _creation_locks_lock,
+        _env_cache_key,
         _resolve_container_task_id,
         _is_unusable_container_cwd,
         _is_backend_guest_subpath,
@@ -1060,15 +1073,18 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
 
     raw_task_id = task_id or "default"
     task_id = _resolve_container_task_id(raw_task_id)
+    # Every cache read/write below goes through the profile-scoped key; the
+    # bare container ``task_id`` stays for the backend factory and logging.
+    cache_key = _env_cache_key(raw_task_id)
 
     # Fast path: check cache -- but also verify the underlying environment
     # is still alive (it may have been killed by the cleanup thread).
     with _file_ops_lock:
-        cached = _file_ops_cache.get(task_id)
+        cached = _file_ops_cache.get(cache_key)
     if cached is not None:
         with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
+            if cache_key in _active_environments:
+                _last_activity[cache_key] = time.time()
                 return cached
             else:
                 # Environment was cleaned up -- preserve the old cwd before
@@ -1077,23 +1093,23 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                 old_cwd = getattr(cached, "cwd", None)
                 if old_cwd:
                     with _file_ops_lock:
-                        _last_known_cwd[task_id] = old_cwd
+                        _last_known_cwd[cache_key] = old_cwd
                 with _file_ops_lock:
-                    _file_ops_cache.pop(task_id, None)
+                    _file_ops_cache.pop(cache_key, None)
 
     # Need to ensure the environment exists before building file_ops.
     # Acquire per-task lock so only one thread creates the sandbox.
     with _creation_locks_lock:
-        if task_id not in _creation_locks:
-            _creation_locks[task_id] = threading.Lock()
-        task_lock = _creation_locks[task_id]
+        if cache_key not in _creation_locks:
+            _creation_locks[cache_key] = threading.Lock()
+        task_lock = _creation_locks[cache_key]
 
     with task_lock:
         # Double-check: another thread may have created it while we waited
         with _env_lock:
-            if task_id in _active_environments:
-                _last_activity[task_id] = time.time()
-                terminal_env = _active_environments[task_id]
+            if cache_key in _active_environments:
+                _last_activity[cache_key] = time.time()
+                terminal_env = _active_environments[cache_key]
             else:
                 terminal_env = None
 
@@ -1117,7 +1133,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             else:
                 image = ""
 
-            cwd = overrides.get("cwd") or _last_known_cwd.get(task_id) or config["cwd"]
+            cwd = overrides.get("cwd") or _last_known_cwd.get(cache_key) or config["cwd"]
             # Re-apply the container cwd guard that _get_env_config() already
             # ran on config["cwd"] (see #50636).  A per-task cwd override
             # registered by the gateway/TUI/ACP for workspace tracking is a
@@ -1177,8 +1193,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
             )
 
             with _env_lock:
-                _active_environments[task_id] = terminal_env
-                _last_activity[task_id] = time.time()
+                _active_environments[cache_key] = terminal_env
+                _last_activity[cache_key] = time.time()
 
             _start_cleanup_thread()
             logger.info("%s environment ready for task %s", env_type, task_id[:8])
@@ -1186,15 +1202,21 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     # Build file_ops from the (guaranteed live) environment and cache it
     file_ops = ShellFileOperations(terminal_env)
     with _file_ops_lock:
-        _file_ops_cache[task_id] = file_ops
+        _file_ops_cache[cache_key] = file_ops
     return file_ops
 
 
-def clear_file_ops_cache(task_id: str = None):
-    """Clear the file operations cache."""
+def clear_file_ops_cache(cache_key: str = None):
+    """Clear the file operations cache.
+
+    *cache_key* is terminal_tool's composite ``_env_cache_key`` value — both
+    cleanup call sites in ``terminal_tool`` pass the exact key they popped, so
+    no profile resolution happens here (cleanup runs without the contextvar).
+    ``None`` clears every profile's entries.
+    """
     with _file_ops_lock:
-        if task_id:
-            _file_ops_cache.pop(task_id, None)
+        if cache_key:
+            _file_ops_cache.pop(cache_key, None)
         else:
             _file_ops_cache.clear()
 

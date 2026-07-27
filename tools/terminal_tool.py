@@ -46,6 +46,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from hermes_constants import active_profile_token
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -979,7 +980,14 @@ PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REP
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
 """
 
-# Global state for environment lifecycle management
+# Global state for environment lifecycle management.
+#
+# All four dicts are keyed by the COMPOSITE cache key built by
+# ``_env_cache_key`` -- "<profile token>\x00<container task id>" -- not by the
+# bare container id.  The process is shared by every profile the multiplexing
+# gateway serves, and almost every task id collapses to the literal
+# ``"default"`` container, so a profile-blind key would hand profile B the live
+# sandbox (and the forwarded credentials inside it) that profile A created.
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
 _env_lock = threading.Lock()
@@ -987,6 +995,41 @@ _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox cr
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
 _cleanup_thread = None
 _cleanup_running = False
+
+# NUL: cannot occur in a profile token (hex) or in any task id we generate,
+# so the composite key is unambiguously splittable back into its parts.
+_CACHE_KEY_SEP = "\x00"
+
+
+def _scoped_cache_key(task_or_container_id: str) -> str:
+    """Prefix an ALREADY-resolved id with the active profile's token.
+
+    Used both for the collapsed container id (via :func:`_env_cache_key`) and
+    for the raw task id fallback lookups that predate the collapse.
+    """
+    return f"{active_profile_token()}{_CACHE_KEY_SEP}{task_or_container_id}"
+
+
+def _env_cache_key(task_id: Optional[str]) -> str:
+    """Key for ``_active_environments`` / ``_last_activity`` / ``_creation_locks``.
+
+    Profile identity comes from :func:`active_profile_token`, which reads the
+    per-turn ``HERMES_HOME`` contextvar -- so this MUST be called while the
+    turn's context is live, never from the cleanup thread or ``atexit``.
+    Cleanup paths work off keys they already hold (see
+    :func:`_container_id_from_cache_key`) instead of re-resolving a profile.
+    """
+    return _scoped_cache_key(_resolve_container_task_id(task_id))
+
+
+def _container_id_from_cache_key(key: str) -> str:
+    """Recover the bare container/sandbox id from a composite cache key.
+
+    ``process_registry`` sessions and (pre-composite) callers key off the plain
+    container id, so cleanup must strip the profile prefix before talking to
+    them.  Tolerates an un-prefixed key so a raw id round-trips unchanged.
+    """
+    return key.split(_CACHE_KEY_SEP, 1)[-1]
 
 # Once-per-process guard for the docker orphan reaper (issue #20561).
 # Set when _maybe_reap_docker_orphans first runs; concurrent _create_environment
@@ -1105,10 +1148,12 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # (ACP/gateway/dashboard) and under the collapsed container id for
         # isolation-keyed rollouts. Try the raw id first, then the container id,
         # so a CWD-only override (which collapses to "default") still finds and
-        # updates the originating session's env.
-        container_id = _resolve_container_task_id(task_id)
+        # updates the originating session's env.  Both are looked up through
+        # the profile-scoped cache key.
+        raw_key = _scoped_cache_key(task_id)
+        container_key = _env_cache_key(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(raw_key) or _active_environments.get(container_key)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1473,9 +1518,41 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
                         local_config: dict = None,
                         task_id: str = "default",
                         host_cwd: str = None):
+    """Build an environment and stamp the *active* profile onto it.
+
+    See :func:`_build_environment` for the backend factory. The profile token
+    and cache key are bound HERE, at construction, while the turn's context is
+    still live: the idle reaper and ``atexit`` run on bare threads with a fresh
+    ``contextvars.Context`` and could never re-derive them. Same
+    construction-time binding Tenki does for its snapshot store.
+    """
+    env = _build_environment(
+        env_type=env_type,
+        image=image,
+        cwd=cwd,
+        timeout=timeout,
+        ssh_config=ssh_config,
+        container_config=container_config,
+        local_config=local_config,
+        task_id=task_id,
+        host_cwd=host_cwd,
+    )
+    try:
+        env._hermes_profile_token = active_profile_token()
+        env._hermes_env_cache_key = _env_cache_key(task_id)
+    except Exception:  # __slots__ backends / exotic stubs — identity is advisory
+        logger.debug("Could not stamp profile identity on %s", type(env).__name__)
+    return env
+
+
+def _build_environment(env_type: str, image: str, cwd: str, timeout: int,
+                       ssh_config: dict = None, container_config: dict = None,
+                       local_config: dict = None,
+                       task_id: str = "default",
+                       host_cwd: str = None):
     """
     Create an execution environment for sandboxed command execution.
-    
+
     Args:
         env_type: One of "local", "docker", "singularity", "modal",
             "daytona", "tenki", "ssh"
@@ -1646,16 +1723,29 @@ def _create_environment(env_type: str, image: str, cwd: str, timeout: int,
 
 
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
-    """Clean up environments that have been inactive for longer than lifetime_seconds."""
+    """Clean up environments that have been inactive for longer than lifetime_seconds.
+
+    Runs on a bare daemon thread with a fresh ``contextvars.Context``, so it can
+    never resolve "the current profile". Everything here is driven off the
+    composite cache keys already in the dicts, decomposed with
+    :func:`_container_id_from_cache_key` where a bare container id is required.
+    """
     current_time = time.time()
 
     # Check the process registry -- skip cleanup for sandboxes with active
     # background processes (their _last_activity gets refreshed to keep them alive).
+    # process_registry sessions are registered with the BARE container id, so
+    # strip the profile prefix before asking.
     try:
         from tools.process_registry import process_registry
-        for task_id in list(_last_activity.keys()):
-            if process_registry.has_active_processes(task_id):
-                _last_activity[task_id] = current_time  # Keep sandbox alive
+        for cache_key in list(_last_activity.keys()):
+            # env_cache_key keeps the match profile-accurate: without it, any
+            # profile's background process (task_id "default" for everyone)
+            # would pin every profile's idle sandbox alive.
+            if process_registry.has_active_processes(
+                _container_id_from_cache_key(cache_key), env_cache_key=cache_key
+            ):
+                _last_activity[cache_key] = current_time  # Keep sandbox alive
     except ImportError:
         pass
 
@@ -1663,29 +1753,31 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # holding the lock.  Do NOT call env.cleanup() inside the lock -- Modal and
     # Docker teardown can block for 10-15s, which would stall every concurrent
     # terminal/file tool call waiting on _env_lock.
-    envs_to_stop = []  # list of (task_id, env) pairs
+    envs_to_stop = []  # list of (cache_key, env) pairs
 
     with _env_lock:
-        for task_id, last_time in list(_last_activity.items()):
+        for cache_key, last_time in list(_last_activity.items()):
             if current_time - last_time > lifetime_seconds:
-                env = _active_environments.pop(task_id, None)
-                _last_activity.pop(task_id, None)
+                env = _active_environments.pop(cache_key, None)
+                _last_activity.pop(cache_key, None)
                 if env is not None:
-                    envs_to_stop.append((task_id, env))
+                    envs_to_stop.append((cache_key, env))
 
         # Also purge per-task creation locks for cleaned-up tasks
         with _creation_locks_lock:
-            for task_id, _ in envs_to_stop:
-                _creation_locks.pop(task_id, None)
+            for cache_key, _ in envs_to_stop:
+                _creation_locks.pop(cache_key, None)
 
     # Phase 2: stop the actual sandboxes OUTSIDE the lock so other tool calls
     # are not blocked while Modal/Docker sandboxes shut down.
-    for task_id, env in envs_to_stop:
+    for cache_key, env in envs_to_stop:
+        task_id = _container_id_from_cache_key(cache_key)
         # Invalidate stale file_ops cache entry (Bug fix: prevents
-        # ShellFileOperations from referencing a dead sandbox)
+        # ShellFileOperations from referencing a dead sandbox).  file_tools
+        # keys its caches by the same composite key, so pass it through whole.
         try:
             from tools.file_tools import clear_file_ops_cache
-            clear_file_ops_cache(task_id)
+            clear_file_ops_cache(cache_key)
         except ImportError:
             pass
 
@@ -1745,10 +1837,14 @@ def _stop_cleanup_thread():
 
 
 def get_active_env(task_id: str):
-    """Return the active BaseEnvironment for *task_id*, or None."""
-    lookup = _resolve_container_task_id(task_id)
+    """Return the active BaseEnvironment for *task_id* in THIS profile, or None."""
+    lookup = _env_cache_key(task_id)
+    raw_lookup = _scoped_cache_key(task_id) if task_id else None
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        env = _active_environments.get(lookup)
+        if env is None and raw_lookup is not None:
+            env = _active_environments.get(raw_lookup)
+        return env
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -1771,17 +1867,24 @@ def is_persistent_env(task_id: str) -> bool:
 
 
 def cleanup_all_environments():
-    """Clean up ALL active environments. Use with caution."""
-    task_ids = list(_active_environments.keys())
+    """Clean up ALL active environments, across EVERY profile. Use with caution.
+
+    Gateway shutdown and ``atexit`` run without the per-turn ``HERMES_HOME``
+    contextvar, so this must never try to resolve "the current profile" — it
+    sweeps every composite key in the cache and hands each one back to
+    :func:`cleanup_vm` verbatim.
+    """
+    with _env_lock:
+        cache_keys = list(_active_environments.keys())
     cleaned = 0
-    
-    for task_id in task_ids:
+
+    for cache_key in cache_keys:
         try:
-            cleanup_vm(task_id)
+            cleanup_vm(_container_id_from_cache_key(cache_key), cache_key=cache_key)
             cleaned += 1
         except Exception as e:
-            logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
-    
+            logger.error("Error cleaning %s: %s", cache_key, e, exc_info=True)
+
     # Also clean any orphaned directories
     scratch_dir = _get_scratch_dir()
     import glob
@@ -1797,8 +1900,14 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str, *, force_remove: bool = False):
+def cleanup_vm(task_id: str, *, force_remove: bool = False, cache_key: str = None):
     """Manually clean up a specific environment by task_id.
+
+    *cache_key*, when given, is the exact composite key to evict — used by
+    :func:`cleanup_all_environments` / ``atexit``, which sweep every profile
+    from a context where the profile is not resolvable. When it is omitted the
+    caller is inside the turn's context and the key is derived there; a raw
+    ``task_id`` entry is popped as a fallback for pre-composite callers.
 
     *force_remove* (default False) is forwarded to backends that accept it
     — currently only ``DockerEnvironment``. The default of False matches
@@ -1818,63 +1927,89 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     via this function), so persist-mode idle envs are similarly no-op'd —
     only the orphan reaper at next startup reclaims them.
     """
+    if cache_key is not None:
+        keys = [cache_key]
+    elif not task_id:
+        # Pre-composite behavior: a falsy task_id never matched a cache entry,
+        # so it stays a no-op — resolving it would collapse to the shared
+        # container and tear down the profile's sandbox.
+        return
+    else:
+        # Deliberately NOT _env_cache_key(task_id): that collapses any
+        # unregistered id to the shared "default" container, so the per-turn
+        # hook (turn_finalizer -> cleanup_task_resources, called with a fresh
+        # uuid every turn) would start tearing the shared sandbox down on
+        # every turn and throw away the shell state local/docker keep across
+        # turns. Profile-scoping the pre-existing raw-id pop preserves today's
+        # semantics exactly: "default" and isolation-keyed ids match, per-turn
+        # uuids don't. Plus the un-prefixed raw id for pre-composite callers.
+        keys = [_scoped_cache_key(task_id)]
+        if task_id not in keys:
+            keys.append(task_id)
+
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
-    env = None
+    # Both the composite and the raw key may hold (distinct) envs; every
+    # popped env must be torn down, not just the first.
+    envs = []
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        for key in keys:
+            popped = _active_environments.pop(key, None)
+            _last_activity.pop(key, None)
+            if popped is not None and popped not in envs:
+                envs.append(popped)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        for key in keys:
+            _creation_locks.pop(key, None)
 
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        for key in keys:
+            clear_file_ops_cache(key)
     except ImportError:
         pass
 
-    if env is None:
-        return
+    for env in envs:
+        try:
+            if hasattr(env, 'cleanup'):
+                # Pass force_remove only if the env's cleanup() accepts it
+                # (DockerEnvironment after issue #20561; other backends don't).
+                import inspect
+                sig = inspect.signature(env.cleanup)
+                if "force_remove" in sig.parameters:
+                    env.cleanup(force_remove=force_remove)
+                else:
+                    env.cleanup()
+            elif hasattr(env, 'stop'):
+                env.stop()
+            elif hasattr(env, 'terminate'):
+                env.terminate()
 
-    try:
-        if hasattr(env, 'cleanup'):
-            # Pass force_remove only if the env's cleanup() accepts it
-            # (DockerEnvironment after issue #20561; other backends don't).
-            import inspect
-            sig = inspect.signature(env.cleanup)
-            if "force_remove" in sig.parameters:
-                env.cleanup(force_remove=force_remove)
+            logger.info("Manually cleaned up environment for task: %s", task_id)
+
+        except Exception as e:
+            error_str = str(e)
+            if "404" in error_str or "not found" in error_str.lower():
+                logger.info("Environment for task %s already cleaned up", task_id)
             else:
-                env.cleanup()
-        elif hasattr(env, 'stop'):
-            env.stop()
-        elif hasattr(env, 'terminate'):
-            env.terminate()
-
-        logger.info("Manually cleaned up environment for task: %s", task_id)
-
-    except Exception as e:
-        error_str = str(e)
-        if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
-        else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+                logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
 
 
 def _atexit_cleanup():
     """Stop cleanup thread and shut down all remaining sandboxes on exit."""
     _stop_cleanup_thread()
-    if _active_environments:
-        count = len(_active_environments)
-        logger.info("Shutting down %d remaining sandbox(es)...", count)
-        # Snapshot the env objects BEFORE cleanup_all_environments empties
-        # the dict; we need them to wait on docker cleanup threads after the
-        # registry has been cleared.
+    # Snapshot the env objects BEFORE cleanup_all_environments empties the
+    # dict; we need them to wait on docker cleanup threads after the registry
+    # has been cleared.  Covers every profile's keys — this handler has no
+    # HERMES_HOME contextvar and must not leak another profile's sandbox.
+    with _env_lock:
         envs_to_wait = list(_active_environments.values())
+    if envs_to_wait:
+        logger.info("Shutting down %d remaining sandbox(es)...", len(envs_to_wait))
         cleanup_all_environments()
         # Block briefly so docker stop/rm actually completes before the
         # interpreter exits. Issue #20561 — without this join, the daemon
@@ -2276,6 +2411,12 @@ def terminal_tool(
         # Use a per-task creation lock so concurrent tool calls for the same
         # task_id wait for the first one to finish creating the sandbox,
         # instead of each creating their own (wasting Modal resources).
+        # Profile-scoped cache keys: an env created during another profile's
+        # turn must never be handed to this one (it carries that profile's
+        # forwarded credentials).
+        env_cache_key = _env_cache_key(task_id)
+        raw_cache_key = _scoped_cache_key(task_id) if task_id else None
+
         with _env_lock:
             # Prefer the collapsed container id, but fall back to an env cached
             # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
@@ -2283,8 +2424,8 @@ def terminal_tool(
             # sharing, yet an env may already be cached under the originating
             # task_id; honor it instead of spawning a duplicate.
             _existing_key = (
-                effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
+                env_cache_key if env_cache_key in _active_environments
+                else (raw_cache_key if raw_cache_key and raw_cache_key in _active_environments else None)
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
@@ -2296,16 +2437,16 @@ def terminal_tool(
         if needs_creation:
             # Per-task lock: only one thread creates the sandbox, others wait
             with _creation_locks_lock:
-                if effective_task_id not in _creation_locks:
-                    _creation_locks[effective_task_id] = threading.Lock()
-                task_lock = _creation_locks[effective_task_id]
+                if env_cache_key not in _creation_locks:
+                    _creation_locks[env_cache_key] = threading.Lock()
+                task_lock = _creation_locks[env_cache_key]
 
             with task_lock:
                 # Double-check after acquiring the per-task lock
                 with _env_lock:
                     _existing_key = (
-                        effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
+                        env_cache_key if env_cache_key in _active_environments
+                        else (raw_cache_key if raw_cache_key and raw_cache_key in _active_environments else None)
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
@@ -2357,10 +2498,22 @@ def terminal_tool(
                         }, ensure_ascii=False)
 
                     with _env_lock:
-                        _active_environments[effective_task_id] = new_env
-                        _last_activity[effective_task_id] = time.time()
+                        _active_environments[env_cache_key] = new_env
+                        _last_activity[env_cache_key] = time.time()
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
+
+        # Tripwire for the profile-scoping invariant: a cached env stamped with
+        # a different construction-time profile means the composite key stopped
+        # isolating profiles. Cheap enough to leave on the hot path.
+        _stamped_token = getattr(env, "_hermes_profile_token", None)
+        if isinstance(_stamped_token, str) and _stamped_token and not env_cache_key.startswith(
+            _stamped_token + _CACHE_KEY_SEP
+        ):
+            logger.debug(
+                "terminal: env built under profile token %s reused under key %r",
+                _stamped_token, env_cache_key,
+            )
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
@@ -2508,6 +2661,9 @@ def terminal_tool(
                         task_id=effective_task_id,
                         session_key=session_key,
                     )
+                # Stamp the profile-scoped cache key so the idle reaper's
+                # keep-alive probe matches only this profile's sandbox.
+                proc_session.env_cache_key = _scoped_cache_key(effective_task_id)
 
                 result_data = {
                     "output": "Background process started",

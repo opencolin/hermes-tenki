@@ -1739,8 +1739,15 @@ class ProcessRegistry:
 
     # ----- Session/Task Queries (for gateway integration) -----
 
-    def has_active_processes(self, task_id: str) -> bool:
-        """Check if there are active (running) processes for a task_id."""
+    def has_active_processes(self, task_id: str, *, env_cache_key: str = None) -> bool:
+        """Check if there are active (running) processes for a task_id.
+
+        ``env_cache_key`` narrows the match to sessions stamped with that
+        environment cache key (the terminal tool stamps its spawns). Sessions
+        without a stamp — spawned by paths that predate profile scoping —
+        still match on ``task_id`` alone, conservatively keeping every
+        profile's sandbox alive rather than none.
+        """
         with self._lock:
             sessions = list(self._running.values())
 
@@ -1749,7 +1756,12 @@ class ProcessRegistry:
 
         with self._lock:
             return any(
-                s.task_id == task_id and not s.exited
+                s.task_id == task_id
+                and not s.exited
+                and (
+                    env_cache_key is None
+                    or getattr(s, "env_cache_key", None) in (None, env_cache_key)
+                )
                 for s in self._running.values()
             )
 

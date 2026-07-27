@@ -155,7 +155,7 @@ def test_container_path_detection_uses_live_docker_environment(monkeypatch):
     monkeypatch.setattr(
         terminal_tool,
         "_active_environments",
-        {"default": _DummyDockerEnvironment()},
+        {terminal_tool._env_cache_key(None): _DummyDockerEnvironment()},
     )
     monkeypatch.setattr(
         terminal_tool,
@@ -419,7 +419,7 @@ def _two_worktree_sessions(tmp_path, monkeypatch):
     monkeypatch.setattr(
         terminal_tool,
         "_active_environments",
-        {"default": _FakeOwnedEnv(str(wt_b), "sess-b")},
+        {terminal_tool._env_cache_key(None): _FakeOwnedEnv(str(wt_b), "sess-b")},
     )
     return wt_a, wt_b, main
 
@@ -457,7 +457,7 @@ def test_unknown_owner_keeps_prior_single_session_behavior(tmp_path, monkeypatch
     monkeypatch.setattr(
         terminal_tool,
         "_active_environments",
-        {"default": _FakeOwnedEnv(str(ws), "")},
+        {terminal_tool._env_cache_key(None): _FakeOwnedEnv(str(ws), "")},
     )
     assert ft._get_live_tracking_cwd("default") == str(ws)
     assert ft._get_live_tracking_cwd("any-session") == str(ws)
@@ -469,7 +469,8 @@ def test_preserved_cwd_does_not_override_non_owning_sessions_worktree(
     """#26211 belt-and-suspenders must not break worktree isolation.
 
     The owner (session B) doing an owned live read mirrors wt_b into the shared
-    _last_known_cwd['default'] registry. Session A — which does NOT own the env
+    profile-scoped shared _last_known_cwd registry. Session A — which does NOT
+    own the env
     but HAS its own registered worktree (wt_a) — must still resolve into wt_a,
     not inherit B's preserved cwd through the shared-container key. The
     session-specific registered override must beat the durable shared anchor.
@@ -477,9 +478,9 @@ def test_preserved_cwd_does_not_override_non_owning_sessions_worktree(
     wt_a, wt_b, _main = _two_worktree_sessions
     monkeypatch.setattr(ft, "_last_known_cwd", {})
 
-    # Owner B resolves first — this mirrors wt_b into _last_known_cwd['default'].
+    # Owner B resolves first — this mirrors wt_b into the shared _last_known_cwd.
     assert ft._resolve_path_for_task("target.py", task_id="sess-b") == (wt_b / "target.py")
-    assert ft._last_known_cwd.get("default") == str(wt_b)
+    assert ft._last_known_cwd.get(terminal_tool._env_cache_key(None)) == str(wt_b)
 
     # A still routes to its own registered worktree despite the shared anchor.
     resolved_a = ft._resolve_path_for_task("target.py", task_id="sess-a")
