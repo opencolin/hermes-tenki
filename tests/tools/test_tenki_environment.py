@@ -161,6 +161,27 @@ class _FakeInvalidStateError(Exception):
     """Mirrors tenki_sandbox.InvalidStateError for the fake SDK."""
 
 
+class _FakeTemplateRuntimeFailedError(Exception):
+    """Mirrors tenki_sandbox.TemplateRuntimeFailedError (SDK >= 0.4.0).
+
+    A failed ``wait_for_runtime`` reports the failure but leaves the sandbox
+    running, so the error carries it in ``.sandbox``; tests set
+    ``leaked_sandbox`` to whatever the server would have left behind.
+    """
+
+    leaked_sandbox = None
+
+    def __init__(self, message):
+        super().__init__(message)
+        self.reason = message
+        self.sandbox = type(self).leaked_sandbox
+
+
+# The reaper matches the SDK type by name (SDKs older than 0.4.0 do not export
+# the class), so the fake has to carry the real name.
+_FakeTemplateRuntimeFailedError.__name__ = "TemplateRuntimeFailedError"
+
+
 class _FakeSandboxFactory:
     created_kwargs: list[dict] = []
     failed_kwargs: list[dict] = []
@@ -189,6 +210,7 @@ class _FakeSandboxFactory:
 
 class _FakeClient:
     listed_sandboxes: list[_FakeSandbox] = []
+    resolvable_sandboxes: dict[str, _FakeSandbox] = {}
     closed_count = 0
 
     def __init__(self, **kwargs):
@@ -197,6 +219,9 @@ class _FakeClient:
 
     def create(self, **kwargs):
         return _FakeSandboxFactory.create(**kwargs)
+
+    def get(self, sandbox_id):
+        return self.resolvable_sandboxes[sandbox_id]
 
     def list(self, **_kwargs):
         return list(self.listed_sandboxes)
@@ -211,7 +236,29 @@ class _FakeClient:
         type(self).closed_count += 1
 
 
-def _install_fake_tenki(monkeypatch):
+class _ModernSignatureClient(_FakeClient):
+    """Client whose ``create`` mirrors tenki-sandbox >= 0.4.0: explicit named
+    parameters and no ``**kwargs``, so signature gating is exact.
+
+    Used as a signature probe only — ephemeral creates run through
+    ``Sandbox.create``, so this body is never reached.
+    """
+
+    def create(self, *, name=None, image=None, snapshot_id=None, wait=True,
+               wait_for_runtime=False, timeout=180):
+        raise AssertionError("signature-only fake: create should not be called")
+
+
+class _LegacySignatureClient(_FakeClient):
+    """Client whose ``create`` predates ``wait_for_runtime`` — passing the kwarg
+    would raise TypeError, so it must not be emitted. Signature probe only."""
+
+    def create(self, *, name=None, image=None, snapshot_id=None, wait=True,
+               timeout=180):
+        raise AssertionError("signature-only fake: create should not be called")
+
+
+def _install_fake_tenki(monkeypatch, *, client_cls: type = _FakeClient):
     module = types.ModuleType("tenki_sandbox")
     _FakeSandboxFactory.created_kwargs = []
     _FakeSandboxFactory.failed_kwargs = []
@@ -219,9 +266,22 @@ def _install_fake_tenki(monkeypatch):
     _FakeSandboxFactory.fail_snapshot_ids = set()
     _FakeSandboxFactory.snapshot_error = _FakeSnapshotNotFoundError
     _FakeSandboxFactory.snapshot_error_msg = "restore failed"
+    _FakeTemplateRuntimeFailedError.leaked_sandbox = None
     _FakeClient.listed_sandboxes = []
+    _FakeClient.resolvable_sandboxes = {}
+    # close() writes closed_count onto type(self), so a subclass client_cls
+    # accumulates its own counter — reset both to keep tests independent.
     _FakeClient.closed_count = 0
-    module.Client = _FakeClient
+    client_cls.closed_count = 0
+    # The no-template-runtime latch is process-wide by design; tests must not
+    # inherit another test's latched image.
+    try:
+        from tools.environments import tenki as _tenki_module
+
+        _tenki_module._RUNTIME_WAIT_UNSUPPORTED_IMAGES.clear()
+    except Exception:
+        pass
+    module.Client = client_cls
     module.Sandbox = _FakeSandboxFactory
     module.SnapshotNotFoundError = _FakeSnapshotNotFoundError
     # Mirror tenki-sandbox >= 0.3.x, which renamed the registry error; the
@@ -325,6 +385,10 @@ def test_tenki_environment_uses_cli_config_and_terminates_by_default(monkeypatch
     assert kwargs["allow_inbound"] is False
     assert kwargs["allow_outbound"] is True
     assert kwargs["cpu_cores"] == 1
+    # Readiness is deterministic: RUNNING (wait) *and* the image runtime
+    # (wait_for_runtime) before the first exec.
+    assert kwargs["wait"] is True
+    assert kwargs["wait_for_runtime"] is True
     assert "idle_timeout" not in kwargs
     assert "idle_timeout_minutes" not in kwargs
     assert "pause_retention" not in kwargs
@@ -893,6 +957,99 @@ def test_tenki_legacy_registry_error_name_still_unrecoverable(monkeypatch):
     assert TenkiEnvironment._snapshot_unrecoverable(_FakeRegistryImageNotFoundError("gone"))
 
 
+def _write_tenki_config(monkeypatch, tmp_path):
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+
+def test_tenki_terminates_sandbox_left_running_by_failed_runtime_wait(monkeypatch, tmp_path):
+    """A failed ``wait_for_runtime`` reports TemplateRuntimeFailedError without
+    terminating the sandbox, so it must be reaped here — otherwise it bills
+    until max_duration. The failure stays transient: the snapshot pointer
+    survives for a later retry."""
+    _install_fake_tenki(monkeypatch)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments import tenki as tenki_module
+    from tools.environments.tenki import TenkiEnvironment
+
+    tenki_module._store_snapshot("persist", "snap-runtime")
+    _FakeSandboxFactory.fail_snapshot_ids = {"snap-runtime"}
+    _FakeSandboxFactory.snapshot_error = _FakeTemplateRuntimeFailedError
+    leaked = _FakeSandbox(name="sb-runtime")
+    _FakeTemplateRuntimeFailedError.leaked_sandbox = leaked
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    with pytest.raises(_FakeTemplateRuntimeFailedError):
+        TenkiEnvironment(task_id="persist", image="base-image", persistent_filesystem=True)
+
+    assert leaked.terminated is True
+    assert _FakeSandboxFactory.created_kwargs == []
+    assert tenki_module._get_snapshot_restore_candidate("persist") == ("snap-runtime", False)
+
+
+def test_tenki_runtime_failure_resolves_info_only_sandbox_through_client(monkeypatch, tmp_path):
+    """tenki-sandbox 0.4.0 attaches a data-only SandboxInfo, so the reaper has
+    to resolve a live handle by id before it can terminate the leak."""
+    _install_fake_tenki(monkeypatch)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments import tenki as tenki_module
+    from tools.environments.tenki import TenkiEnvironment
+
+    tenki_module._store_snapshot("persist", "snap-runtime-info")
+    _FakeSandboxFactory.fail_snapshot_ids = {"snap-runtime-info"}
+    _FakeSandboxFactory.snapshot_error = _FakeTemplateRuntimeFailedError
+    leaked = _FakeSandbox(name="sb-runtime-info")
+    _FakeTemplateRuntimeFailedError.leaked_sandbox = SimpleNamespace(id="sb-leaked")
+    _FakeClient.resolvable_sandboxes = {"sb-leaked": leaked}
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    with pytest.raises(_FakeTemplateRuntimeFailedError):
+        TenkiEnvironment(task_id="persist", image="base-image", persistent_filesystem=True)
+
+    assert leaked.terminated is True
+    assert tenki_module._get_snapshot_restore_candidate("persist") == ("snap-runtime-info", False)
+
+
+def test_tenki_runtime_failure_propagates_when_terminate_fails(monkeypatch, tmp_path):
+    """Reaping is best-effort: a failing terminate() must never mask the
+    original runtime failure or destroy the snapshot pointer."""
+    _install_fake_tenki(monkeypatch)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments import tenki as tenki_module
+    from tools.environments.tenki import TenkiEnvironment
+
+    tenki_module._store_snapshot("persist", "snap-runtime-boom")
+    _FakeSandboxFactory.fail_snapshot_ids = {"snap-runtime-boom"}
+    _FakeSandboxFactory.snapshot_error = _FakeTemplateRuntimeFailedError
+    leaked = _FakeSandbox(name="sb-runtime-boom")
+    attempts: list[str] = []
+
+    def _failing_terminate():
+        attempts.append("terminate")
+        raise RuntimeError("terminate rpc failed")
+
+    leaked.terminate = _failing_terminate
+    _FakeTemplateRuntimeFailedError.leaked_sandbox = leaked
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    with pytest.raises(_FakeTemplateRuntimeFailedError):
+        TenkiEnvironment(task_id="persist", image="base-image", persistent_filesystem=True)
+
+    # The create is attempted twice (runtime gate, then the gateless retry);
+    # each failure raises a fresh exception with its own leaked handle, and
+    # each is reaped best-effort exactly once.
+    assert attempts == ["terminate", "terminate"]
+    assert leaked.terminated is False
+    assert _FakeSandboxFactory.created_kwargs == []
+    assert tenki_module._get_snapshot_restore_candidate("persist") == ("snap-runtime-boom", False)
+
+
 def test_tenki_snapshot_store_bound_to_construction_profile(monkeypatch, tmp_path):
     """Cleanup (which may run in a background thread without the per-turn
     HERMES_HOME contextvar) must write the snapshot pointer to the profile that
@@ -1083,6 +1240,193 @@ def test_tenki_environment_passes_positive_pause_retention(monkeypatch, tmp_path
 
     kwargs = _FakeSandboxFactory.created_kwargs[0]
     assert kwargs["pause_retention"] == 3600
+    env.cleanup()
+
+
+def test_tenki_emits_wait_for_runtime_when_client_create_declares_it(monkeypatch, tmp_path):
+    """Gating is on Client.create — both create paths funnel into it, and unlike
+    Sandbox.create ((cls, **kwargs)) its explicit parameter list is a reliable
+    signal that the SDK understands the kwarg."""
+    _install_fake_tenki(monkeypatch, client_cls=_ModernSignatureClient)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="runtime-modern", persistent_filesystem=False)
+
+    kwargs = _FakeSandboxFactory.created_kwargs[0]
+    assert kwargs["wait"] is True
+    assert kwargs["wait_for_runtime"] is True
+    env.cleanup()
+
+
+def test_tenki_falls_back_when_image_has_no_template_runtime(monkeypatch, tmp_path):
+    """Live-verified server behavior: ``wait_for_runtime=True`` on an image with
+    no declared template runtime fails the whole create with
+    "wait_for_runtime requires a template runtime". The environment must retry
+    once without the kwarg and remember, so later creates skip the doomed
+    attempt entirely."""
+    _install_fake_tenki(monkeypatch, client_cls=_ModernSignatureClient)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    attempts: list[dict] = []
+    original_create = _FakeSandboxFactory.create.__func__
+
+    def create_rejecting_runtime_wait(cls, **kwargs):
+        attempts.append(dict(kwargs))
+        if kwargs.get("wait_for_runtime"):
+            raise RuntimeError("sandbox: wait_for_runtime requires a template runtime")
+        return original_create(cls, **kwargs)
+
+    monkeypatch.setattr(
+        _FakeSandboxFactory, "create", classmethod(create_rejecting_runtime_wait)
+    )
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    env = TenkiEnvironment(task_id="runtime-fallback", persistent_filesystem=False)
+
+    assert len(attempts) == 2
+    assert attempts[0]["wait_for_runtime"] is True
+    assert "wait_for_runtime" not in attempts[1]
+    assert attempts[1]["wait"] is True
+    assert env._runtime_wait_unsupported is True
+
+    # A later create on the same environment must not repeat the doomed attempt.
+    attempts.clear()
+    env._create_sandbox_from_kwargs(env._create_kwargs())
+    assert len(attempts) == 1
+    assert "wait_for_runtime" not in attempts[0]
+    env.cleanup()
+
+
+def test_tenki_ephemeral_create_carries_client_deadline(monkeypatch, tmp_path):
+    """On the ephemeral path ``timeout`` is Sandbox.create's *client* timeout —
+    the gRPC deadline for the server-held create. Without it the call is
+    unbounded, which wait_for_runtime makes strictly worse."""
+    _install_fake_tenki(monkeypatch, client_cls=_ModernSignatureClient)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="ephemeral-deadline", persistent_filesystem=False)
+
+    kwargs = _FakeSandboxFactory.created_kwargs[0]
+    assert kwargs["timeout"] >= 180
+    env.cleanup()
+
+
+def test_tenki_runtime_wait_latch_is_shared_across_environments(monkeypatch, tmp_path):
+    """The no-template-runtime rejection is a property of the image, not the
+    environment instance: a second environment for the same image must skip
+    the guaranteed-failing first attempt entirely."""
+    _install_fake_tenki(monkeypatch, client_cls=_ModernSignatureClient)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    attempts: list[dict] = []
+    original_create = _FakeSandboxFactory.create.__func__
+
+    def create_rejecting_runtime_wait(cls, **kwargs):
+        attempts.append(dict(kwargs))
+        if kwargs.get("wait_for_runtime"):
+            raise RuntimeError("sandbox: wait_for_runtime requires a template runtime")
+        return original_create(cls, **kwargs)
+
+    monkeypatch.setattr(
+        _FakeSandboxFactory, "create", classmethod(create_rejecting_runtime_wait)
+    )
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    env_a = TenkiEnvironment(task_id="latch-a", persistent_filesystem=False)
+    assert len(attempts) == 2  # doomed attempt + fallback
+    env_a.cleanup()
+
+    attempts.clear()
+    env_b = TenkiEnvironment(task_id="latch-b", persistent_filesystem=False)
+    assert len(attempts) == 1
+    assert "wait_for_runtime" not in attempts[0]
+    env_b.cleanup()
+
+
+def test_tenki_runtime_failure_reaps_and_retries_without_gate(monkeypatch, tmp_path):
+    """A genuine TemplateRuntimeFailedError (runtime exists, failed to start)
+    must not hard-fail construction: reap the leaked sandbox, retry once
+    without the gate — pre-gate behavior — and do NOT latch, so the next
+    construction regains determinism."""
+    _install_fake_tenki(monkeypatch, client_cls=_ModernSignatureClient)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments import tenki as tenki_module
+    from tools.environments.tenki import TenkiEnvironment
+
+    leaked = _FakeSandbox(name="sb-leaked-runtime")
+    attempts: list[dict] = []
+    original_create = _FakeSandboxFactory.create.__func__
+
+    def create_failing_runtime(cls, **kwargs):
+        attempts.append(dict(kwargs))
+        if kwargs.get("wait_for_runtime"):
+            error = _FakeTemplateRuntimeFailedError("template runtime failed: probe timed out")
+            error.sandbox = leaked
+            raise error
+        return original_create(cls, **kwargs)
+
+    monkeypatch.setattr(
+        _FakeSandboxFactory, "create", classmethod(create_failing_runtime)
+    )
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    env = TenkiEnvironment(task_id="runtime-degrade", persistent_filesystem=False)
+
+    assert leaked.terminated is True
+    assert len(attempts) == 2
+    assert "wait_for_runtime" not in attempts[1]
+    # Not latched: a runtime that failed once may succeed next construction.
+    assert not tenki_module._RUNTIME_WAIT_UNSUPPORTED_IMAGES
+    env.cleanup()
+
+
+def test_tenki_unrelated_create_failure_does_not_trigger_runtime_fallback(monkeypatch, tmp_path):
+    """Only the specific no-template-runtime rejection triggers the retry; any
+    other create failure propagates unchanged on the first attempt."""
+    _install_fake_tenki(monkeypatch, client_cls=_ModernSignatureClient)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    attempts: list[dict] = []
+
+    def create_always_failing(cls, **kwargs):
+        attempts.append(dict(kwargs))
+        raise RuntimeError("quota exceeded")
+
+    monkeypatch.setattr(_FakeSandboxFactory, "create", classmethod(create_always_failing))
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    with pytest.raises(RuntimeError, match="quota exceeded"):
+        TenkiEnvironment(task_id="runtime-unrelated", persistent_filesystem=False)
+    assert len(attempts) == 1
+
+
+def test_tenki_omits_wait_for_runtime_on_older_sdk_client(monkeypatch, tmp_path):
+    """An SDK whose Client.create predates ``wait_for_runtime`` would raise
+    TypeError on the kwarg, so it must be omitted — while ``wait`` stays."""
+    _install_fake_tenki(monkeypatch, client_cls=_LegacySignatureClient)
+    _write_tenki_config(monkeypatch, tmp_path)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="runtime-legacy", persistent_filesystem=False)
+
+    kwargs = _FakeSandboxFactory.created_kwargs[0]
+    assert "wait_for_runtime" not in kwargs
+    assert kwargs["wait"] is True
     env.cleanup()
 
 
