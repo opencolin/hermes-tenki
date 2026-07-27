@@ -146,7 +146,11 @@ class _FakeSnapshotNotFoundError(Exception):
 
 
 class _FakeRegistryArtifactNotFoundError(Exception):
-    """Mirrors tenki_sandbox.RegistryArtifactNotFoundError for the fake SDK."""
+    """Mirrors tenki_sandbox.RegistryArtifactNotFoundError (SDK <= 0.1.x)."""
+
+
+class _FakeRegistryImageNotFoundError(Exception):
+    """Mirrors tenki_sandbox.RegistryImageNotFoundError (SDK >= 0.3.x)."""
 
 
 class _FakeSnapshotNotDurableError(Exception):
@@ -220,7 +224,9 @@ def _install_fake_tenki(monkeypatch):
     module.Client = _FakeClient
     module.Sandbox = _FakeSandboxFactory
     module.SnapshotNotFoundError = _FakeSnapshotNotFoundError
-    module.RegistryArtifactNotFoundError = _FakeRegistryArtifactNotFoundError
+    # Mirror tenki-sandbox >= 0.3.x, which renamed the registry error; the
+    # legacy name is exercised via the name-based fallback tests below.
+    module.RegistryImageNotFoundError = _FakeRegistryImageNotFoundError
     module.SnapshotNotDurableError = _FakeSnapshotNotDurableError
     module.InvalidStateError = _FakeInvalidStateError
     monkeypatch.setitem(sys.modules, "tenki_sandbox", module)
@@ -844,6 +850,47 @@ def test_tenki_restore_falls_back_on_snapshot_specific_invalid_state(monkeypatch
     assert _FakeSandboxFactory.created_kwargs[0]["image"] == "base-image"
     assert tenki_module._get_snapshot_restore_candidate("persist") == (None, False)
     env.cleanup()
+
+
+def test_tenki_restore_falls_back_on_registry_image_not_found(monkeypatch, tmp_path):
+    """RegistryImageNotFoundError (the SDK >= 0.3.x rename of
+    RegistryArtifactNotFoundError) confirms the backing image is gone →
+    unrecoverable: drop the pointer and boot the base image."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments import tenki as tenki_module
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tenki_module._store_snapshot("persist", "snap-gone-image")
+    _FakeSandboxFactory.fail_snapshot_ids = {"snap-gone-image"}
+    _FakeSandboxFactory.snapshot_error = _FakeRegistryImageNotFoundError
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    env = TenkiEnvironment(task_id="persist", image="base-image", persistent_filesystem=True)
+
+    assert _FakeSandboxFactory.created_kwargs[0]["image"] == "base-image"
+    assert tenki_module._get_snapshot_restore_candidate("persist") == (None, False)
+    env.cleanup()
+
+
+def test_tenki_legacy_registry_error_name_still_unrecoverable(monkeypatch):
+    """An exception *named* RegistryArtifactNotFoundError (raised by an SDK
+    <= 0.1.x install, which the fake module — mirroring >= 0.3.x — does not
+    export) must still classify as unrecoverable via the name-based fallback."""
+    _install_fake_tenki(monkeypatch)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    # The name-based fallback matches on __name__, so build an exception type
+    # that carries the legacy SDK's real class name.
+    legacy_error = type("RegistryArtifactNotFoundError", (Exception,), {})
+    assert TenkiEnvironment._snapshot_unrecoverable(legacy_error("gone"))
+    assert TenkiEnvironment._snapshot_unrecoverable(_FakeRegistryImageNotFoundError("gone"))
 
 
 def test_tenki_snapshot_store_bound_to_construction_profile(monkeypatch, tmp_path):

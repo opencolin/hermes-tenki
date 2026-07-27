@@ -663,7 +663,8 @@ class TenkiEnvironment(BaseEnvironment):
     # transient so an unrelated precondition can't destroy a valid pointer.
     _UNRECOVERABLE_SNAPSHOT_ERRORS = frozenset({
         "SnapshotNotFoundError",          # snapshot is gone
-        "RegistryArtifactNotFoundError",  # backing artifact is gone
+        "RegistryArtifactNotFoundError",  # backing artifact is gone (SDK <= 0.1.x)
+        "RegistryImageNotFoundError",     # backing image is gone (SDK >= 0.3.x)
         "SnapshotNotDurableError",        # explicitly never reached durability
     })
 
@@ -689,21 +690,32 @@ class TenkiEnvironment(BaseEnvironment):
             return "snapshot" in msg or "durable" in msg
 
         try:
-            from tenki_sandbox import (
-                InvalidStateError,
-                RegistryArtifactNotFoundError,
-                SnapshotNotDurableError,
-                SnapshotNotFoundError,
-            )
+            import tenki_sandbox as _sdk
 
-            if isinstance(
-                exc,
-                (SnapshotNotFoundError, RegistryArtifactNotFoundError, SnapshotNotDurableError),
+            # tenki-sandbox 0.4.0 renamed RegistryArtifactNotFoundError to
+            # RegistryImageNotFoundError; resolve both so either SDK
+            # generation classifies a gone backing image as unrecoverable.
+            unrecoverable_types = tuple(
+                t
+                for t in (
+                    getattr(_sdk, name, None)
+                    for name in (
+                        "SnapshotNotFoundError",
+                        "RegistryArtifactNotFoundError",
+                        "RegistryImageNotFoundError",
+                        "SnapshotNotDurableError",
+                    )
+                )
+                if isinstance(t, type)
+            )
+            invalid_state_cls = getattr(_sdk, "InvalidStateError", None)
+
+            if unrecoverable_types and isinstance(exc, unrecoverable_types):
+                return True
+            if invalid_state_cls is not None and _is_snapshot_specific_invalid_state(
+                exc, invalid_state_cls
             ):
                 return True
-            if _is_snapshot_specific_invalid_state(exc, InvalidStateError):
-                return True
-            return False
         except Exception:
             pass
         # Name-based fallback for SDK builds that don't export every class.
