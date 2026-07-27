@@ -146,7 +146,11 @@ class _FakeSnapshotNotFoundError(Exception):
 
 
 class _FakeRegistryArtifactNotFoundError(Exception):
-    """Mirrors tenki_sandbox.RegistryArtifactNotFoundError for the fake SDK."""
+    """Mirrors tenki_sandbox.RegistryArtifactNotFoundError (SDK <= 0.1.x)."""
+
+
+class _FakeRegistryImageNotFoundError(Exception):
+    """Mirrors tenki_sandbox.RegistryImageNotFoundError (SDK >= 0.3.x)."""
 
 
 class _FakeSnapshotNotDurableError(Exception):
@@ -220,7 +224,9 @@ def _install_fake_tenki(monkeypatch):
     module.Client = _FakeClient
     module.Sandbox = _FakeSandboxFactory
     module.SnapshotNotFoundError = _FakeSnapshotNotFoundError
-    module.RegistryArtifactNotFoundError = _FakeRegistryArtifactNotFoundError
+    # Mirror tenki-sandbox >= 0.3.x, which renamed the registry error; the
+    # legacy name is exercised via the name-based fallback tests below.
+    module.RegistryImageNotFoundError = _FakeRegistryImageNotFoundError
     module.SnapshotNotDurableError = _FakeSnapshotNotDurableError
     module.InvalidStateError = _FakeInvalidStateError
     monkeypatch.setitem(sys.modules, "tenki_sandbox", module)
@@ -846,6 +852,47 @@ def test_tenki_restore_falls_back_on_snapshot_specific_invalid_state(monkeypatch
     env.cleanup()
 
 
+def test_tenki_restore_falls_back_on_registry_image_not_found(monkeypatch, tmp_path):
+    """RegistryImageNotFoundError (the SDK >= 0.3.x rename of
+    RegistryArtifactNotFoundError) confirms the backing image is gone →
+    unrecoverable: drop the pointer and boot the base image."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments import tenki as tenki_module
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    tenki_module._store_snapshot("persist", "snap-gone-image")
+    _FakeSandboxFactory.fail_snapshot_ids = {"snap-gone-image"}
+    _FakeSandboxFactory.snapshot_error = _FakeRegistryImageNotFoundError
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+
+    env = TenkiEnvironment(task_id="persist", image="base-image", persistent_filesystem=True)
+
+    assert _FakeSandboxFactory.created_kwargs[0]["image"] == "base-image"
+    assert tenki_module._get_snapshot_restore_candidate("persist") == (None, False)
+    env.cleanup()
+
+
+def test_tenki_legacy_registry_error_name_still_unrecoverable(monkeypatch):
+    """An exception *named* RegistryArtifactNotFoundError (raised by an SDK
+    <= 0.1.x install, which the fake module — mirroring >= 0.3.x — does not
+    export) must still classify as unrecoverable via the name-based fallback."""
+    _install_fake_tenki(monkeypatch)
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    # The name-based fallback matches on __name__, so build an exception type
+    # that carries the legacy SDK's real class name.
+    legacy_error = type("RegistryArtifactNotFoundError", (Exception,), {})
+    assert TenkiEnvironment._snapshot_unrecoverable(legacy_error("gone"))
+    assert TenkiEnvironment._snapshot_unrecoverable(_FakeRegistryImageNotFoundError("gone"))
+
+
 def test_tenki_snapshot_store_bound_to_construction_profile(monkeypatch, tmp_path):
     """Cleanup (which may run in a background thread without the per-turn
     HERMES_HOME contextvar) must write the snapshot pointer to the profile that
@@ -1095,6 +1142,82 @@ def test_tenki_bulk_sync_stages_tar_under_home_not_tmp(monkeypatch, tmp_path):
     assert remote_tar.startswith("/home/tenki/.hermes_tenki_sync.")
     assert not remote_tar.startswith("/tmp/")
     env.cleanup()
+
+
+def test_tenki_upload_survives_cancel_clearing_sandbox(monkeypatch, tmp_path):
+    """cancel() nulls self._sandbox; an in-flight upload must keep running
+    against the one sandbox reference it captured instead of raising
+    AttributeError on the cleared attribute."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="upload-race")
+    env._ensure_sandbox()
+    first = env._sandbox
+
+    # Simulate a concurrent cancel() landing right after the mkdir step.
+    original_mkdir = first.fs.mkdir
+
+    def mkdir_then_cancel(path, **kwargs):
+        original_mkdir(path, **kwargs)
+        with env._lock:
+            env._sandbox = None
+
+    first.fs.mkdir = mkdir_then_cancel
+
+    host_file = tmp_path / "f.txt"
+    host_file.write_text("x", encoding="utf-8")
+    env._tenki_upload(str(host_file), "/home/tenki/f.txt")
+
+    assert first.fs.upload_calls == [(str(host_file), "/home/tenki/f.txt")]
+
+
+def test_tenki_bulk_upload_single_sandbox_across_cancel(monkeypatch, tmp_path):
+    """A cancel()+recreate landing mid-bulk-transfer must not split the
+    mkdir/upload/untar/cleanup steps across two sandboxes: everything runs
+    on the sandbox captured at the start of the operation."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="bulk-race")
+    env._ensure_sandbox()
+    first = env._sandbox
+    second = _FakeSandbox(name="sb-other")
+
+    # Simulate cancel() plus a concurrent command re-ensuring a fresh sandbox
+    # right after the first exec (the mkdir step) completes.
+    original_exec = first.exec
+
+    def exec_then_swap(*args, **kwargs):
+        result = original_exec(*args, **kwargs)
+        with env._lock:
+            env._sandbox = second
+        return result
+
+    first.exec = exec_then_swap
+
+    host_file = tmp_path / "skill.md"
+    host_file.write_text("content", encoding="utf-8")
+    env._tenki_bulk_upload([(str(host_file), "/home/tenki/.hermes/skills/skill.md")])
+
+    assert first.fs.upload_calls, "tar upload must target the captured sandbox"
+    assert any(
+        "tar xf" in (call[0][-1] if call[0] else "") for call in first.exec_calls
+    ), "untar must run on the captured sandbox"
+    assert second.exec_calls == []
+    assert second.fs.upload_calls == []
 
 
 def test_tenki_bulk_sync_uses_documented_fs_root_when_home_differs(monkeypatch, tmp_path):

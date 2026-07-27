@@ -1602,8 +1602,8 @@ def run_doctor(args):
         else:
             _fail_and_issue(
                 "tenki-sandbox SDK not installed",
-                "(pip install tenki-sandbox==0.1.1)",
-                "Install Tenki SDK: pip install tenki-sandbox==0.1.1",
+                "(pip install tenki-sandbox==0.4.0)",
+                "Install Tenki SDK: pip install tenki-sandbox==0.4.0",
                 issues,
             )
 

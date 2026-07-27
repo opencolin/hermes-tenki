@@ -663,7 +663,8 @@ class TenkiEnvironment(BaseEnvironment):
     # transient so an unrelated precondition can't destroy a valid pointer.
     _UNRECOVERABLE_SNAPSHOT_ERRORS = frozenset({
         "SnapshotNotFoundError",          # snapshot is gone
-        "RegistryArtifactNotFoundError",  # backing artifact is gone
+        "RegistryArtifactNotFoundError",  # backing artifact is gone (SDK <= 0.1.x)
+        "RegistryImageNotFoundError",     # backing image is gone (SDK >= 0.3.x)
         "SnapshotNotDurableError",        # explicitly never reached durability
     })
 
@@ -689,21 +690,32 @@ class TenkiEnvironment(BaseEnvironment):
             return "snapshot" in msg or "durable" in msg
 
         try:
-            from tenki_sandbox import (
-                InvalidStateError,
-                RegistryArtifactNotFoundError,
-                SnapshotNotDurableError,
-                SnapshotNotFoundError,
-            )
+            import tenki_sandbox as _sdk
 
-            if isinstance(
-                exc,
-                (SnapshotNotFoundError, RegistryArtifactNotFoundError, SnapshotNotDurableError),
+            # tenki-sandbox 0.4.0 renamed RegistryArtifactNotFoundError to
+            # RegistryImageNotFoundError; resolve both so either SDK
+            # generation classifies a gone backing image as unrecoverable.
+            unrecoverable_types = tuple(
+                t
+                for t in (
+                    getattr(_sdk, name, None)
+                    for name in (
+                        "SnapshotNotFoundError",
+                        "RegistryArtifactNotFoundError",
+                        "RegistryImageNotFoundError",
+                        "SnapshotNotDurableError",
+                    )
+                )
+                if isinstance(t, type)
+            )
+            invalid_state_cls = getattr(_sdk, "InvalidStateError", None)
+
+            if unrecoverable_types and isinstance(exc, unrecoverable_types):
+                return True
+            if invalid_state_cls is not None and _is_snapshot_specific_invalid_state(
+                exc, invalid_state_cls
             ):
                 return True
-            if _is_snapshot_specific_invalid_state(exc, InvalidStateError):
-                return True
-            return False
         except Exception:
             pass
         # Name-based fallback for SDK builds that don't export every class.
@@ -764,19 +776,25 @@ class TenkiEnvironment(BaseEnvironment):
             pass
 
     def _tenki_upload(self, host_path: str, remote_path: str) -> None:
-        self._ensure_sandbox()
+        # One captured reference for the whole operation: cancel() may null
+        # out self._sandbox between these calls (see _require_sandbox).
+        sandbox = self._require_sandbox()
         parent = str(Path(remote_path).parent)
-        self._sandbox.fs.mkdir(parent, recursive=True)
-        self._sandbox.fs.upload(host_path, remote_path)
+        sandbox.fs.mkdir(parent, recursive=True)
+        sandbox.fs.upload(host_path, remote_path)
 
     def _tenki_bulk_upload(self, files: list[tuple[str, str]]) -> None:
         if not files:
             return
 
-        self._ensure_sandbox()
+        # One captured reference for the whole bulk transfer: cancel() may
+        # null out self._sandbox mid-operation (see _require_sandbox), and the
+        # mkdir/upload/untar/cleanup steps must all target the same sandbox
+        # rather than splitting across a teardown/recreate boundary.
+        sandbox = self._require_sandbox()
         parents = unique_parent_dirs(files)
         if parents:
-            self._exec_raw(quoted_mkdir_command(parents), timeout=30)
+            self._exec_raw_on_sandbox(sandbox, quoted_mkdir_command(parents), timeout=30)
 
         remote_tar = self._remote_transfer_path(".hermes_tenki_sync")
         with tempfile.NamedTemporaryFile(suffix=".tar") as tmp:
@@ -784,10 +802,11 @@ class TenkiEnvironment(BaseEnvironment):
                 for host_path, remote_path in files:
                     tar.add(host_path, arcname=remote_path.lstrip("/"))
             tmp.flush()
-            self._sandbox.fs.upload(tmp.name, remote_tar)
+            sandbox.fs.upload(tmp.name, remote_tar)
 
         try:
-            output, exit_code = self._exec_raw(
+            output, exit_code = self._exec_raw_on_sandbox(
+                sandbox,
                 f"tar xf {shlex.quote(remote_tar)} -C /",
                 timeout=120,
             )
@@ -795,7 +814,7 @@ class TenkiEnvironment(BaseEnvironment):
                 raise RuntimeError(f"Tenki bulk upload failed (exit {exit_code}): {output}")
         finally:
             try:
-                self._exec_raw(f"rm -f {shlex.quote(remote_tar)}", timeout=10)
+                self._exec_raw_on_sandbox(sandbox, f"rm -f {shlex.quote(remote_tar)}", timeout=10)
             except Exception:
                 pass
 
