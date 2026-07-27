@@ -1144,6 +1144,82 @@ def test_tenki_bulk_sync_stages_tar_under_home_not_tmp(monkeypatch, tmp_path):
     env.cleanup()
 
 
+def test_tenki_upload_survives_cancel_clearing_sandbox(monkeypatch, tmp_path):
+    """cancel() nulls self._sandbox; an in-flight upload must keep running
+    against the one sandbox reference it captured instead of raising
+    AttributeError on the cleared attribute."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="upload-race")
+    env._ensure_sandbox()
+    first = env._sandbox
+
+    # Simulate a concurrent cancel() landing right after the mkdir step.
+    original_mkdir = first.fs.mkdir
+
+    def mkdir_then_cancel(path, **kwargs):
+        original_mkdir(path, **kwargs)
+        with env._lock:
+            env._sandbox = None
+
+    first.fs.mkdir = mkdir_then_cancel
+
+    host_file = tmp_path / "f.txt"
+    host_file.write_text("x", encoding="utf-8")
+    env._tenki_upload(str(host_file), "/home/tenki/f.txt")
+
+    assert first.fs.upload_calls == [(str(host_file), "/home/tenki/f.txt")]
+
+
+def test_tenki_bulk_upload_single_sandbox_across_cancel(monkeypatch, tmp_path):
+    """A cancel()+recreate landing mid-bulk-transfer must not split the
+    mkdir/upload/untar/cleanup steps across two sandboxes: everything runs
+    on the sandbox captured at the start of the operation."""
+    _install_fake_tenki(monkeypatch)
+    _clear_tenki_auth_env(monkeypatch)
+    monkeypatch.setattr("tools.lazy_deps.ensure", lambda *_args, **_kwargs: None)
+    monkeypatch.setenv("TENKI_CONFIG_PATH", str(tmp_path / "config.yaml"))
+    (tmp_path / "config.yaml").write_text("auth_token: tok-secret\n", encoding="utf-8")
+
+    from tools.environments.tenki import TenkiEnvironment
+
+    monkeypatch.setattr(TenkiEnvironment, "init_session", lambda self: None)
+    env = TenkiEnvironment(task_id="bulk-race")
+    env._ensure_sandbox()
+    first = env._sandbox
+    second = _FakeSandbox(name="sb-other")
+
+    # Simulate cancel() plus a concurrent command re-ensuring a fresh sandbox
+    # right after the first exec (the mkdir step) completes.
+    original_exec = first.exec
+
+    def exec_then_swap(*args, **kwargs):
+        result = original_exec(*args, **kwargs)
+        with env._lock:
+            env._sandbox = second
+        return result
+
+    first.exec = exec_then_swap
+
+    host_file = tmp_path / "skill.md"
+    host_file.write_text("content", encoding="utf-8")
+    env._tenki_bulk_upload([(str(host_file), "/home/tenki/.hermes/skills/skill.md")])
+
+    assert first.fs.upload_calls, "tar upload must target the captured sandbox"
+    assert any(
+        "tar xf" in (call[0][-1] if call[0] else "") for call in first.exec_calls
+    ), "untar must run on the captured sandbox"
+    assert second.exec_calls == []
+    assert second.fs.upload_calls == []
+
+
 def test_tenki_bulk_sync_uses_documented_fs_root_when_home_differs(monkeypatch, tmp_path):
     _install_fake_tenki(monkeypatch)
     _clear_tenki_auth_env(monkeypatch)

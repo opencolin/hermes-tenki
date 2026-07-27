@@ -1848,7 +1848,7 @@ requires-dist = [
     { name = "starlette", marker = "extra == 'web'", specifier = "==1.0.1" },
     { name = "supermemory", marker = "extra == 'supermemory'", specifier = "==3.50.0" },
     { name = "tenacity", specifier = "==9.1.4" },
-    { name = "tenki-sandbox", marker = "extra == 'tenki'", specifier = "==0.4.0" },
+    { name = "tenki-sandbox", marker = "extra == 'tenki'", specifier = ">=0.4.0,<0.6" },
     { name = "ty", marker = "extra == 'dev'", specifier = "==0.0.21" },
     { name = "tzdata", marker = "sys_platform == 'win32'", specifier = "==2025.3" },
     { name = "urllib3", specifier = ">=2.7.0,<3" },
