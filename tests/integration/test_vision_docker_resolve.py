@@ -74,16 +74,17 @@ def docker_backend(request, monkeypatch):
         volumes=[],
         network=False,
     )
-    # Register under the raw task_id; get_active_env() falls back to the raw
-    # key after trying the _resolve_container_task_id() mapping.
+    # Register under the raw task_id (profile-scoped); get_active_env() falls
+    # back to that key after trying the _resolve_container_task_id() mapping.
+    cache_key = terminal_tool._scoped_cache_key(task_id)
     with terminal_tool._env_lock:
-        terminal_tool._active_environments[task_id] = env
+        terminal_tool._active_environments[cache_key] = env
     try:
         env._task_id = task_id
         yield env
     finally:
         with terminal_tool._env_lock:
-            terminal_tool._active_environments.pop(task_id, None)
+            terminal_tool._active_environments.pop(cache_key, None)
         try:
             env.cleanup()
         except Exception:

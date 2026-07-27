@@ -27,6 +27,13 @@ def _make_env_config(**overrides):
     return config
 
 
+def _cache_key():
+    """Profile-scoped key the env cache actually uses for the shared sandbox."""
+    from tools.terminal_tool import _env_cache_key
+
+    return _env_cache_key(None)
+
+
 class TestForegroundTimeoutCap:
     """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it."""
 
@@ -85,8 +92,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "usage", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            key = _cache_key()
+            with patch("tools.terminal_tool._active_environments", {key: mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {key: 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(command="pnpm dev --help"))
 
@@ -104,8 +112,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            key = _cache_key()
+            with patch("tools.terminal_tool._active_environments", {key: mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {key: 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(
                     command="echo hello",
@@ -132,8 +141,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            key = _cache_key()
+            with patch("tools.terminal_tool._active_environments", {key: mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {key: 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(command="make build"))
 
@@ -158,8 +168,9 @@ class TestForegroundTimeoutCap:
             mock_registry = MagicMock()
             mock_registry.spawn_local.return_value = mock_proc_session
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            key = _cache_key()
+            with patch("tools.terminal_tool._active_environments", {key: mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {key: 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
                  patch("tools.process_registry.process_registry", mock_registry), \
                  patch("tools.approval.get_current_session_key", return_value=""):
@@ -185,8 +196,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            key = _cache_key()
+            with patch("tools.terminal_tool._active_environments", {key: mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {key: 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(command="echo hello"))
 
@@ -204,8 +216,9 @@ class TestForegroundTimeoutCap:
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}
 
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
+            key = _cache_key()
+            with patch("tools.terminal_tool._active_environments", {key: mock_env}), \
+                 patch("tools.terminal_tool._last_activity", {key: 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(
                     command="echo hello",

@@ -697,6 +697,7 @@ class TestLastKnownCwd:
         self, mock_create_env, mock_config, mock_cache, mock_active
     ):
         from tools.file_tools import _get_file_ops, _last_known_cwd
+        from tools.terminal_tool import _env_cache_key
 
         # Setup: create a mock env with a known CWD
         mock_env = MagicMock()
@@ -709,9 +710,12 @@ class TestLastKnownCwd:
         }
 
         task_id = "default"
+        # The registries are keyed by the profile-scoped cache key, not the
+        # bare container id (see tests/tools/test_profile_scoped_env_cache.py).
+        cache_key = _env_cache_key(task_id)
 
         # Preset _last_known_cwd to simulate a previous env's CWD
-        _last_known_cwd[task_id] = "/Users/user/project"
+        _last_known_cwd[cache_key] = "/Users/user/project"
 
         # Call _get_file_ops - should use _last_known_cwd for the new env
         result = _get_file_ops(task_id)
@@ -733,10 +737,10 @@ class TestLastKnownCwd:
         
         assert cwd_passed == "/Users/user/project", \
             f"Expected cwd='/Users/user/project', got {cwd_passed!r}"
-        
+
         # Cleanup
-        _last_known_cwd.pop(task_id, None)
-        
+        _last_known_cwd.pop(cache_key, None)
+
     @patch("tools.terminal_tool._active_environments", new_callable=dict)
     @patch("tools.file_tools._file_ops_cache", new_callable=dict)
     @patch("tools.terminal_tool._get_env_config")
@@ -745,6 +749,7 @@ class TestLastKnownCwd:
         self, mock_create_env, mock_config, mock_cache, mock_active
     ):
         from tools.file_tools import _get_file_ops, _last_known_cwd
+        from tools.terminal_tool import _env_cache_key
 
         mock_env = MagicMock()
         mock_env.cwd = "/default/path"
@@ -757,9 +762,9 @@ class TestLastKnownCwd:
 
         # _get_file_ops resolves to "default"
         task_id = "default"
-        
+
         # Ensure _last_known_cwd is empty for this task
-        _last_known_cwd.pop(task_id, None)
+        _last_known_cwd.pop(_env_cache_key(task_id), None)
 
         result = _get_file_ops(task_id)
         
@@ -784,22 +789,24 @@ class TestLastKnownCwd:
         the cwd in _last_known_cwd, so the durable anchor doesn't depend on the
         cleanup-detection branch of _get_file_ops firing."""
         from tools.file_tools import _get_live_tracking_cwd, _last_known_cwd
+        from tools.terminal_tool import _env_cache_key
 
         task_id = "default"
-        _last_known_cwd.pop(task_id, None)
+        cache_key = _env_cache_key(task_id)
+        _last_known_cwd.pop(cache_key, None)
 
         cached = MagicMock()
         cached.env = MagicMock()
         cached.env.cwd = "/Users/user/project"
         cached.env.cwd_owner = "default"
-        mock_cache[task_id] = cached
+        mock_cache[cache_key] = cached
 
         live = _get_live_tracking_cwd(task_id)
 
         assert live == "/Users/user/project"
         # The read mirrored the live cwd into the durable registry.
-        assert _last_known_cwd.get(task_id) == "/Users/user/project"
-        _last_known_cwd.pop(task_id, None)
+        assert _last_known_cwd.get(cache_key) == "/Users/user/project"
+        _last_known_cwd.pop(cache_key, None)
 
     @patch("tools.terminal_tool._active_environments", new_callable=dict)
     @patch("tools.file_tools._file_ops_cache", new_callable=dict)
@@ -816,9 +823,11 @@ class TestLastKnownCwd:
         from tools.file_tools import (
             _get_file_ops, _get_live_tracking_cwd, _last_known_cwd,
         )
+        from tools.terminal_tool import _env_cache_key
 
         task_id = "default"
-        _last_known_cwd.pop(task_id, None)
+        cache_key = _env_cache_key(task_id)
+        _last_known_cwd.pop(cache_key, None)
 
         # 1) Env is alive and the agent has cd'd into the project. A live read
         #    (happens on every relative-path resolution) mirrors the cwd.
@@ -826,13 +835,13 @@ class TestLastKnownCwd:
         cached.env = MagicMock()
         cached.env.cwd = "/Users/user/project"
         cached.env.cwd_owner = "default"
-        mock_cache[task_id] = cached
+        mock_cache[cache_key] = cached
         assert _get_live_tracking_cwd(task_id) == "/Users/user/project"
-        assert _last_known_cwd.get(task_id) == "/Users/user/project"
+        assert _last_known_cwd.get(cache_key) == "/Users/user/project"
 
         # 2) Cleanup thread kills the env AND clears the cache before the next
         #    file write — so _get_file_ops' save-old-cwd branch never runs.
-        mock_cache.pop(task_id, None)
+        mock_cache.pop(cache_key, None)
         mock_active.clear()
 
         mock_env = MagicMock()
@@ -858,7 +867,7 @@ class TestLastKnownCwd:
         # Rebuilt env restored the mirrored cwd, NOT the config default.
         assert cwd_passed == "/Users/user/project", \
             f"Expected restored cwd='/Users/user/project', got {cwd_passed!r}"
-        _last_known_cwd.pop(task_id, None)
+        _last_known_cwd.pop(cache_key, None)
 
 
 class TestSilentFileMisplacementE2E:
@@ -889,7 +898,8 @@ class TestSilentFileMisplacementE2E:
         )
 
         task_id = "default"
-        ft._last_known_cwd.pop(task_id, None)
+        cache_key = tt._env_cache_key(task_id)
+        ft._last_known_cwd.pop(cache_key, None)
 
         # 1) Env alive; agent has cd'd into the project. A relative write
         #    while alive mirrors the live cwd into the durable registry.
@@ -901,10 +911,10 @@ class TestSilentFileMisplacementE2E:
 
         # 2) Cleanup thread kills the env AND clears the file_ops cache.
         with tt._env_lock:
-            tt._active_environments.pop(task_id, None)
-            tt._last_activity.pop(task_id, None)
+            tt._active_environments.pop(cache_key, None)
+            tt._last_activity.pop(cache_key, None)
         with ft._file_ops_lock:
-            ft._file_ops_cache.pop(task_id, None)
+            ft._file_ops_cache.pop(cache_key, None)
 
         # 3) The next relative write must still land in the project dir.
         res = json.loads(ft.write_file_tool("report.txt", "hello\n", task_id))
@@ -913,4 +923,4 @@ class TestSilentFileMisplacementE2E:
         assert not (config_default / "report.txt").exists(), \
             "file silently misplaced into config default (the #26211 bug)"
 
-        ft._last_known_cwd.pop(task_id, None)
+        ft._last_known_cwd.pop(cache_key, None)

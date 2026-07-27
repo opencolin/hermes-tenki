@@ -39,8 +39,8 @@ def test_terminal_background_disables_pty_for_gh_with_token(monkeypatch, tmp_pat
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool_module, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
-    monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
-    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    monkeypatch.setitem(terminal_tool_module._active_environments, terminal_tool_module._env_cache_key(None), dummy_env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, terminal_tool_module._env_cache_key(None), 0.0)
 
     try:
         result = json.loads(
@@ -51,8 +51,8 @@ def test_terminal_background_disables_pty_for_gh_with_token(monkeypatch, tmp_pat
             )
         )
     finally:
-        terminal_tool_module._active_environments.pop("default", None)
-        terminal_tool_module._last_activity.pop("default", None)
+        terminal_tool_module._active_environments.pop(terminal_tool_module._env_cache_key(None), None)
+        terminal_tool_module._last_activity.pop(terminal_tool_module._env_cache_key(None), None)
 
     assert captured["use_pty"] is False
     assert result["session_id"] == "proc_test"
@@ -72,8 +72,8 @@ def test_terminal_background_keeps_pty_for_regular_interactive_commands(monkeypa
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool_module, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
-    monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
-    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    monkeypatch.setitem(terminal_tool_module._active_environments, terminal_tool_module._env_cache_key(None), dummy_env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, terminal_tool_module._env_cache_key(None), 0.0)
 
     try:
         result = json.loads(
@@ -84,8 +84,8 @@ def test_terminal_background_keeps_pty_for_regular_interactive_commands(monkeypa
             )
         )
     finally:
-        terminal_tool_module._active_environments.pop("default", None)
-        terminal_tool_module._last_activity.pop("default", None)
+        terminal_tool_module._active_environments.pop(terminal_tool_module._env_cache_key(None), None)
+        terminal_tool_module._last_activity.pop(terminal_tool_module._env_cache_key(None), None)
 
     assert captured["use_pty"] is True
     assert "pty_note" not in result
