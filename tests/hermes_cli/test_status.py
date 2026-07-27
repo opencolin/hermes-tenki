@@ -1,3 +1,6 @@
+import importlib.machinery
+import sys
+import types
 from types import SimpleNamespace
 
 from hermes_cli.status import show_status
@@ -352,3 +355,371 @@ class TestShowStatusXaiOAuth:
 
         assert "xAI OAuth" in out
         assert "not logged in (run: hermes auth add xai-oauth)" in out
+
+
+# ---------------------------------------------------------------------------
+# Tenki workspace sandbox usage rows
+# ---------------------------------------------------------------------------
+
+class _FakeUsageLimit:
+    """Stand-in for tenki_sandbox.WorkspaceUsageLimit."""
+
+    def __init__(self, key, label, unit, current, maximum=None, help_text=""):
+        self.key = key
+        self.label = label
+        self.unit = unit
+        self.current = current
+        self.max = maximum
+        self.help_text = help_text
+
+
+def _base_tenki_mocks(monkeypatch, tmp_path, *, backend="tenki",
+                      workspace="ws-abc123", project="proj-def456"):
+    """show_status environment with the Tenki terminal backend selected."""
+    import tools.tenki_config as tenki_config_mod
+
+    status_mod = _base_xai_mocks(monkeypatch, tmp_path)
+    import hermes_cli.auth as auth_mod
+    monkeypatch.setattr(auth_mod, "get_xai_oauth_auth_status", lambda: {}, raising=False)
+
+    monkeypatch.setenv("TERMINAL_ENV", backend)
+    monkeypatch.delenv("TERMINAL_TENKI_IMAGE", raising=False)
+    monkeypatch.delenv("TERMINAL_TENKI_SYNC_HERMES_HOME", raising=False)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_api_endpoint",
+                        lambda explicit="": "https://api.tenki.test", raising=False)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_workspace_id",
+                        lambda explicit="": workspace, raising=False)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_project_id",
+                        lambda explicit="": project, raising=False)
+    return status_mod
+
+
+def _fail_if_called(*_args, **_kwargs):
+    raise AssertionError("_tenki_sandbox_usage must not be called here")
+
+
+def test_tenki_usage_renders_count_and_humanized_bytes(monkeypatch, capsys, tmp_path):
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path)
+    limits = [
+        _FakeUsageLimit("sandboxes", "Sandboxes", "count", 2, 5),
+        _FakeUsageLimit("snapshot_bytes", "Snapshot storage", "bytes",
+                        5 * 1024 * 1024 * 1024, None),
+    ]
+    monkeypatch.setattr(
+        status_mod, "_tenki_sandbox_usage",
+        lambda endpoint, workspace_id, project_id, timeout=3.0: (limits, None),
+        raising=False,
+    )
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    out = capsys.readouterr().out
+
+    assert "Sandboxes: 2 active / 5 limit" in out
+    assert "Snapshot storage: 5.0 GB used (unlimited)" in out
+    # First row carries the label; the continuation row aligns under it
+    # without repeating the label column.
+    lines = out.splitlines()
+    first = [ln for ln in lines if "Sandboxes: 2 active" in ln][0]
+    second = [ln for ln in lines if "Snapshot storage:" in ln][0]
+    assert first.startswith("  Usage:")
+    assert not second.strip().startswith("Usage:")
+    assert second.index("Snapshot storage:") == first.index("Sandboxes:")
+
+
+def test_tenki_usage_passes_resolved_workspace_and_project(monkeypatch, capsys, tmp_path):
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path)
+    seen = {}
+
+    def _capture(endpoint, workspace_id, project_id, timeout=3.0):
+        seen.update(endpoint=endpoint, workspace_id=workspace_id,
+                    project_id=project_id, timeout=timeout)
+        return [], None
+
+    monkeypatch.setattr(status_mod, "_tenki_sandbox_usage", _capture, raising=False)
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    capsys.readouterr()
+
+    assert seen == {
+        "endpoint": "https://api.tenki.test",
+        "workspace_id": "ws-abc123",
+        "project_id": "proj-def456",
+        "timeout": 3.0,
+    }
+
+
+def test_tenki_usage_error_degrades_and_report_continues(monkeypatch, capsys, tmp_path):
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        status_mod, "_tenki_sandbox_usage",
+        lambda endpoint, workspace_id, project_id, timeout=3.0: ([], "deadline exceeded"),
+        raising=False,
+    )
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    out = capsys.readouterr().out
+
+    assert "(unavailable: deadline exceeded)" in out
+    assert "◆ Messaging Platforms" in out
+    assert "◆ Gateway Service" in out
+
+
+def test_tenki_usage_helper_exception_degrades_to_dim_row(monkeypatch, capsys, tmp_path):
+    """Even a helper that breaks its contract must not kill the rest of the report."""
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path)
+
+    def _raises(endpoint, workspace_id, project_id, timeout=3.0):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(status_mod, "_tenki_sandbox_usage", _raises, raising=False)
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    out = capsys.readouterr().out
+
+    assert "Usage:" in out
+    assert "◆ Gateway Service" in out
+
+
+def test_tenki_usage_empty_list_shows_no_usage_data(monkeypatch, capsys, tmp_path):
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        status_mod, "_tenki_sandbox_usage",
+        lambda endpoint, workspace_id, project_id, timeout=3.0: ([], None),
+        raising=False,
+    )
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    out = capsys.readouterr().out
+
+    assert "(no usage data)" in out
+
+
+def test_tenki_usage_unresolved_workspace_skips_network_call(monkeypatch, capsys, tmp_path):
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path, workspace="")
+    monkeypatch.setattr(status_mod, "_tenki_sandbox_usage", _fail_if_called, raising=False)
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    out = capsys.readouterr().out
+
+    assert "(workspace not resolved)" in out
+
+
+def test_non_tenki_backend_never_queries_usage(monkeypatch, capsys, tmp_path):
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path, backend="local")
+    monkeypatch.setattr(status_mod, "_tenki_sandbox_usage", _fail_if_called, raising=False)
+
+    status_mod.show_status(SimpleNamespace(all=False, deep=False))
+    out = capsys.readouterr().out
+
+    assert "Usage:" not in out
+    assert "◆ Terminal Backend" in out
+
+
+def test_tenki_usage_never_prints_the_auth_token(monkeypatch, capsys, tmp_path):
+    sentinel = "NONSECRET_TENKI_TOKEN_DO_NOT_PRINT_987654"
+    monkeypatch.setenv("TENKI_AUTH_TOKEN", sentinel)
+    status_mod = _base_tenki_mocks(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        status_mod, "_tenki_sandbox_usage",
+        lambda endpoint, workspace_id, project_id, timeout=3.0: (
+            [_FakeUsageLimit("sandboxes", "Sandboxes", "count", 1, 3)], None
+        ),
+        raising=False,
+    )
+
+    status_mod.show_status(SimpleNamespace(all=True, deep=False))
+    out = capsys.readouterr().out
+
+    assert "Sandboxes: 1 active / 3 limit" in out
+    assert sentinel not in out
+
+
+# --- _tenki_sandbox_usage itself -------------------------------------------
+
+
+def _install_fake_tenki_sdk(monkeypatch, client_cls):
+    module = types.ModuleType("tenki_sandbox")
+    module.__spec__ = importlib.machinery.ModuleSpec("tenki_sandbox", None)
+    module.Client = client_cls
+    monkeypatch.setitem(sys.modules, "tenki_sandbox", module)
+
+
+def test_tenki_sandbox_usage_without_token_returns_error(monkeypatch):
+    from hermes_cli import status as status_mod
+    import tools.tenki_config as tenki_config_mod
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            raise AssertionError("Client must not be built without a token")
+
+    _install_fake_tenki_sdk(monkeypatch, _FakeClient)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_auth_token",
+                        lambda explicit="": "", raising=False)
+
+    limits, error = status_mod._tenki_sandbox_usage("https://api.tenki.test", "ws-1", "")
+
+    assert limits == []
+    assert "not signed in" in error
+
+
+def test_tenki_sandbox_usage_reports_missing_sdk(monkeypatch):
+    """No SDK must not trigger a lazy install prompt — find_spec gates the import."""
+    import importlib.util
+
+    from hermes_cli import status as status_mod
+
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+
+    limits, error = status_mod._tenki_sandbox_usage("", "ws-1", "")
+
+    assert limits == []
+    assert "not installed" in error
+
+
+def test_tenki_sandbox_usage_sets_deadline_and_closes_client(monkeypatch):
+    """Regression guard: no explicit timeout means the RPC has no gRPC deadline."""
+    from hermes_cli import status as status_mod
+    import tools.tenki_config as tenki_config_mod
+
+    recorded = {}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            recorded["init"] = kwargs
+            recorded["closed"] = False
+
+        def get_workspace_sandbox_usage(self, workspace_id, *, project_id=None):
+            recorded["call"] = (workspace_id, project_id)
+            return [_FakeUsageLimit("sandboxes", "Sandboxes", "count", 1, 4)]
+
+        def close(self):
+            recorded["closed"] = True
+
+    _install_fake_tenki_sdk(monkeypatch, _FakeClient)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_auth_token",
+                        lambda explicit="": "cookie:token", raising=False)
+
+    # Deliberately no timeout kwarg: the helper's DEFAULT must carry the
+    # deadline, otherwise removing it would ship green while re-introducing
+    # the unbounded RPC.
+    limits, error = status_mod._tenki_sandbox_usage(
+        "https://api.tenki.test", "ws-1", "proj-1"
+    )
+
+    assert error is None
+    assert len(limits) == 1
+    assert recorded["init"]["timeout"] == 3.0
+    assert recorded["init"]["base_url"] == "https://api.tenki.test"
+    assert recorded["call"] == ("ws-1", "proj-1")
+    assert recorded["closed"] is True
+
+
+def test_tenki_sandbox_usage_closes_client_and_reports_rpc_failure(monkeypatch):
+    from hermes_cli import status as status_mod
+    import tools.tenki_config as tenki_config_mod
+
+    recorded = {"closed": False}
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_workspace_sandbox_usage(self, workspace_id, *, project_id=None):
+            raise RuntimeError("sandbox: unauthorized")
+
+        def close(self):
+            recorded["closed"] = True
+
+    _install_fake_tenki_sdk(monkeypatch, _FakeClient)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_auth_token",
+                        lambda explicit="": "cookie:token", raising=False)
+
+    limits, error = status_mod._tenki_sandbox_usage("", "ws-1", "")
+
+    assert limits == []
+    assert error == "sandbox: unauthorized"
+    assert recorded["closed"] is True
+
+
+def test_tenki_sandbox_usage_reports_constructor_failure(monkeypatch):
+    """Client() raises MissingAuthTokenError-style errors — the ctor is inside the try."""
+    from hermes_cli import status as status_mod
+    import tools.tenki_config as tenki_config_mod
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            raise ValueError("")
+
+    _install_fake_tenki_sdk(monkeypatch, _FakeClient)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_auth_token",
+                        lambda explicit="": "cookie:token", raising=False)
+
+    limits, error = status_mod._tenki_sandbox_usage("", "ws-1", "")
+
+    assert limits == []
+    assert error == "ValueError"
+
+
+def test_tenki_sandbox_usage_close_failure_keeps_result(monkeypatch):
+    """A close() failure after a successful RPC must not discard the result."""
+    from hermes_cli import status as status_mod
+    import tools.tenki_config as tenki_config_mod
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_workspace_sandbox_usage(self, workspace_id, *, project_id=None):
+            return [_FakeUsageLimit("sandboxes", "Sandboxes", "count", 2, 5)]
+
+        def close(self):
+            raise RuntimeError("channel already torn down")
+
+    _install_fake_tenki_sdk(monkeypatch, _FakeClient)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_auth_token",
+                        lambda explicit="": "cookie:token", raising=False)
+
+    limits, error = status_mod._tenki_sandbox_usage("", "ws-1", "")
+
+    assert error is None
+    assert len(limits) == 1
+
+
+def test_tenki_sandbox_usage_redacts_token_from_error(monkeypatch):
+    """An upstream error that echoes the credential must not reach the row."""
+    from hermes_cli import status as status_mod
+    import tools.tenki_config as tenki_config_mod
+
+    sentinel = "cookie:NONSECRET_SENTINEL_TOKEN_13579"
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_workspace_sandbox_usage(self, workspace_id, *, project_id=None):
+            raise RuntimeError(f"auth rejected for {sentinel}\nretry later")
+
+        def close(self):
+            pass
+
+    _install_fake_tenki_sdk(monkeypatch, _FakeClient)
+    monkeypatch.setattr(tenki_config_mod, "resolve_tenki_auth_token",
+                        lambda explicit="": sentinel, raising=False)
+
+    limits, error = status_mod._tenki_sandbox_usage("", "ws-1", "")
+
+    assert limits == []
+    assert sentinel not in error
+    assert "<redacted>" in error
+    assert "\n" not in error  # single line for the fixed-width row
+
+
+def test_format_tenki_usage_handles_unknown_unit():
+    from hermes_cli import status as status_mod
+
+    text = status_mod._format_tenki_usage(
+        _FakeUsageLimit("weird", "Widgets", "unspecified", 7, 9)
+    )
+
+    # Unknown units get no qualifier — "active" is only known-true for counts.
+    assert text == "Widgets: 7 / 9 limit"

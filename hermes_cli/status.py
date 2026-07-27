@@ -99,6 +99,99 @@ def _effective_provider_label() -> str:
     return provider_label(effective)
 
 
+def _fmt_bytes(value) -> str:
+    """Humanize a byte count. Falls back to the raw value if it isn't numeric."""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(num) < 1024.0:
+            return f"{int(num)} {unit}" if unit == "B" else f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} PB"
+
+
+def _format_tenki_usage(limit) -> str:
+    """Render one WorkspaceUsageLimit generically from label/unit/current/max.
+
+    ``current`` counts only resources holding live VMs (paused sessions are
+    excluded), hence the explicit "active" wording; ``max is None`` means
+    unlimited, so no ratio is computed against it.
+    """
+    label = (getattr(limit, "label", "") or getattr(limit, "key", "") or "usage").strip()
+    unit = (getattr(limit, "unit", "") or "").strip().lower()
+    current = getattr(limit, "current", 0)
+    maximum = getattr(limit, "max", None)
+
+    if unit == "bytes":
+        current_text = _fmt_bytes(current)
+        maximum_text = None if maximum is None else _fmt_bytes(maximum)
+        qualifier = "used"
+    else:
+        current_text = str(current)
+        maximum_text = None if maximum is None else str(maximum)
+        # "active" is only true for count dimensions, and labels like
+        # "Active sessions" already say it.
+        qualifier = "active" if unit == "count" and "active" not in label.lower() else ""
+
+    shown = f"{current_text} {qualifier}".rstrip()
+    if maximum_text is None:
+        return f"{label}: {shown} (unlimited)"
+    return f"{label}: {shown} / {maximum_text} limit"
+
+
+def _tenki_sandbox_usage(endpoint: str, workspace_id: str, project_id: str,
+                         timeout: float = 3.0):
+    """Return ``(limits, error_message)`` for a Tenki workspace's sandbox quota.
+
+    Never raises. ``Client(timeout=...)`` is the gRPC deadline for this unary
+    RPC — omitting it means no deadline at all and ``hermes status`` can hang
+    forever against a black-holed endpoint. ``find_spec`` keeps the SDK check
+    from triggering a lazy install (this path also runs inside a Hermes Console
+    chat turn), and ``Client()`` itself raises when the token is empty, so the
+    constructor stays inside the try.
+    """
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("tenki_sandbox") is None:
+            return [], "tenki-sandbox SDK not installed"
+
+        from tenki_sandbox import Client
+        from tools.tenki_config import resolve_tenki_auth_token
+
+        token = resolve_tenki_auth_token()
+        if not token:
+            return [], "not signed in (run: tenki login)"
+
+        client = Client(auth_token=token, base_url=endpoint or None, timeout=timeout)
+        try:
+            limits = client.get_workspace_sandbox_usage(
+                workspace_id, project_id=project_id or None
+            )
+        finally:
+            # A close() failure must not discard a successful result.
+            try:
+                client.close()
+            except Exception:
+                pass
+        return list(limits or []), None
+    except Exception as exc:
+        # One line, bounded, and never echoing the credential: the message is
+        # interpolated verbatim into a fixed-width status row.
+        message = " ".join(str(exc).split()) or exc.__class__.__name__
+        try:
+            from tools.tenki_config import resolve_tenki_auth_token as _tok
+
+            token_value = _tok()
+            if token_value and token_value in message:
+                message = message.replace(token_value, "<redacted>")
+        except Exception:
+            pass
+        return [], message[:160]
+
+
 from hermes_constants import is_termux as _is_termux
 
 
@@ -454,6 +547,27 @@ def show_status(args):
         print(f"  Workspace:    {tenki_workspace or '(not found)'}")
         print(f"  Project:      {tenki_project or '(not found)'}")
         print(f"  Sync .hermes: {check_mark(tenki_sync)} {'enabled' if tenki_sync else 'disabled'}")
+
+        # Live workspace quota. Every failure degrades to a dim row —
+        # show_status has no top-level guard, so an escaping exception would
+        # drop every section after this one.
+        try:
+            if not tenki_workspace:
+                print(f"  Usage:        {color('(workspace not resolved)', Colors.DIM)}")
+            else:
+                usage_limits, usage_error = _tenki_sandbox_usage(
+                    tenki_endpoint, tenki_workspace, tenki_project
+                )
+                if usage_error:
+                    print(f"  Usage:        {color(f'(unavailable: {usage_error})', Colors.DIM)}")
+                elif not usage_limits:
+                    print(f"  Usage:        {color('(no usage data)', Colors.DIM)}")
+                else:
+                    for index, usage_limit in enumerate(usage_limits):
+                        row_label = "Usage:" if index == 0 else ""
+                        print(f"  {row_label:<13} {_format_tenki_usage(usage_limit)}")
+        except Exception:
+            print(f"  Usage:        {color('(unavailable)', Colors.DIM)}")
 
     sudo_password = os.getenv("SUDO_PASSWORD", "")
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
