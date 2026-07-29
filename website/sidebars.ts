@@ -724,6 +724,7 @@ const sidebars: SidebarsConfig = {
             'developer-guide/prompt-assembly',
             'developer-guide/context-compression-and-caching',
             'developer-guide/gateway-internals',
+            'developer-guide/tenki-execution-architecture',
             'developer-guide/session-storage',
             'developer-guide/provider-runtime',
             'developer-guide/programmatic-integration',
