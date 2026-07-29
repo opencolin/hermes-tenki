@@ -9,6 +9,11 @@ environments opt in to isolation by calling
 ``register_task_env_overrides(task_id, {...})`` before the agent loop;
 every other task_id collapses back to ``"default"``.
 
+``_resolve_container_task_id`` returns the *container* id only; the cache
+itself is keyed by ``_env_cache_key`` = ``"<profile token>\\x00<container id>"``
+so profiles served by one multiplexing gateway never share a sandbox. See
+``tests/tools/test_profile_scoped_env_cache.py``.
+
 If you change the collapse logic, update both the helper and these
 tests -- see `hermes-agent-dev` skill, "Why do subagents get their own
 containers?" section, and the Container lifecycle paragraph under
@@ -82,29 +87,35 @@ def test_get_active_env_reads_shared_container_from_subagent_id():
     called with a subagent's task_id, so the agent loop's turn-budget
     enforcement reads the real env (not None) during delegation."""
     sentinel = object()
-    terminal_tool._active_environments["default"] = sentinel
+    # The cache is keyed by "<profile token>\x00<container id>" so two profiles
+    # served by one multiplexing gateway can't share a sandbox; the shared
+    # container id is still "default" within a profile.
+    shared_key = terminal_tool._env_cache_key(None)
+    terminal_tool._active_environments[shared_key] = sentinel
     try:
         assert terminal_tool.get_active_env("subagent-7-cafe") is sentinel
         assert terminal_tool.get_active_env(None) is sentinel
         assert terminal_tool.get_active_env("default") is sentinel
     finally:
-        terminal_tool._active_environments.pop("default", None)
+        terminal_tool._active_environments.pop(shared_key, None)
 
 
 def test_get_active_env_honours_rl_override():
     rl_env = object()
     default_env = object()
-    terminal_tool._active_environments["default"] = default_env
-    terminal_tool._active_environments["rl-42"] = rl_env
     terminal_tool.register_task_env_overrides("rl-42", {"docker_image": "x"})
+    shared_key = terminal_tool._env_cache_key(None)
+    rl_key = terminal_tool._env_cache_key("rl-42")
+    terminal_tool._active_environments[shared_key] = default_env
+    terminal_tool._active_environments[rl_key] = rl_env
     try:
         # With an override registered, lookup returns the task's own env,
         # not the shared "default" one.
         assert terminal_tool.get_active_env("rl-42") is rl_env
     finally:
         terminal_tool.clear_task_env_overrides("rl-42")
-        terminal_tool._active_environments.pop("default", None)
-        terminal_tool._active_environments.pop("rl-42", None)
+        terminal_tool._active_environments.pop(shared_key, None)
+        terminal_tool._active_environments.pop(rl_key, None)
 
 
 def test_cwd_only_override_collapses_to_default():

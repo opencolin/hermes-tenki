@@ -4,6 +4,7 @@ Import-safe module with no dependencies — can be imported from anywhere
 without risk of circular imports.
 """
 
+import hashlib
 import os
 import shutil
 import stat
@@ -108,6 +109,79 @@ def get_hermes_home() -> Path:
                 pass
 
     return _get_platform_default_hermes_home()
+
+
+_PROFILE_TOKEN_MEMO: dict = {}
+
+
+def active_profile_token() -> str:
+    """Short, stable identifier for the Hermes profile active *right now*.
+
+    Used to namespace process-global caches (the terminal environment cache,
+    Tenki sandbox names/metadata) so two profiles served by one multiplexing
+    gateway can never attach to each other's sandbox or credentials.
+
+    MUST be resolved while the turn's context is active — never from a cleanup
+    thread, an ``atexit`` handler, or any other bare ``threading.Thread``.
+    Those start with a fresh ``contextvars.Context``, so
+    ``_HERMES_HOME_OVERRIDE`` is invisible there and this would silently
+    resolve to the *default* profile. Bind the token at construction time and
+    carry it (or a key derived from it) into the cleanup path instead.
+
+    Basis, in order:
+
+    - Under the multiplexing gateway (``agent.secret_scope.is_multiplex_active``)
+      the token derives ONLY from :func:`get_hermes_home`, which honours the
+      per-turn contextvar. ``HERMES_PROFILE`` is deliberately ignored there: it
+      lives in the process-global ``os.environ`` (see
+      ``secret_scope._GLOBAL_ENV_EXACT``) and would collapse every multiplexed
+      profile onto one token.
+    - Otherwise ``HERMES_PROFILE`` wins when set, else the resolved
+      ``HERMES_HOME`` path. This keeps the token byte-identical to what
+      ``tools/environments/tenki.py`` has always emitted for single-profile
+      deployments, so live sandbox names and metadata don't churn on upgrade.
+      (Under multiplexing with ``HERMES_PROFILE`` set the token intentionally
+      diverges — one-time sandbox re-derivation beats every profile colliding
+      on one token.)
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        multiplex = is_multiplex_active()
+    except Exception:
+        # Import-light by contract: hermes_constants must never hard-depend on
+        # the agent package. Treat an unavailable secret_scope as "not
+        # multiplexing", which is the single-profile behavior.
+        multiplex = False
+
+    # Memoized on the raw inputs: this runs on every environment-cache lookup
+    # (terminal, file tools, execute_code), and Path.resolve() plus sha1 are
+    # measurable there. The key captures everything the basis derives from.
+    memo_key = (
+        multiplex,
+        os.environ.get("HERMES_PROFILE", ""),
+        str(get_hermes_home_override() or ""),
+        os.environ.get("HERMES_HOME", ""),
+    )
+    cached = _PROFILE_TOKEN_MEMO.get(memo_key)
+    if cached is not None:
+        return cached
+
+    basis = ""
+    if not multiplex:
+        basis = os.environ.get("HERMES_PROFILE", "").strip()
+        if basis:
+            basis = f"profile:{basis}"
+    if not basis:
+        try:
+            basis = str(get_hermes_home().resolve())
+        except Exception:
+            basis = str(get_hermes_home())
+    token = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:10]
+    if len(_PROFILE_TOKEN_MEMO) >= 256:
+        _PROFILE_TOKEN_MEMO.clear()
+    _PROFILE_TOKEN_MEMO[memo_key] = token
+    return token
 
 
 def get_default_hermes_root() -> Path:

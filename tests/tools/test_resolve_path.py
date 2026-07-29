@@ -63,22 +63,25 @@ class TestResolvePath:
         from tools import file_tools
 
         task_id = "live-cwd"
+        # The file_ops cache is keyed by terminal_tool's profile-scoped key.
+        from tools.terminal_tool import _scoped_cache_key
+        cache_key = _scoped_cache_key(task_id)
         fake_ops = SimpleNamespace(
             env=SimpleNamespace(cwd=str(live_dir)),
             cwd=str(start_dir),
         )
 
         with file_tools._file_ops_lock:
-            previous = file_tools._file_ops_cache.get(task_id)
-            file_tools._file_ops_cache[task_id] = fake_ops
+            previous = file_tools._file_ops_cache.get(cache_key)
+            file_tools._file_ops_cache[cache_key] = fake_ops
 
         try:
             result = file_tools._resolve_path("nested/file.txt", task_id=task_id)
         finally:
             with file_tools._file_ops_lock:
                 if previous is None:
-                    file_tools._file_ops_cache.pop(task_id, None)
+                    file_tools._file_ops_cache.pop(cache_key, None)
                 else:
-                    file_tools._file_ops_cache[task_id] = previous
+                    file_tools._file_ops_cache[cache_key] = previous
 
         assert result == live_dir / "nested" / "file.txt"

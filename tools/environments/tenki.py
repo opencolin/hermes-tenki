@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import logging
 import math
@@ -15,7 +14,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from hermes_constants import get_hermes_home
+from hermes_constants import active_profile_token, get_hermes_home
 from tools.environments.base import (
     BaseEnvironment,
     _ThreadedProcessHandle,
@@ -63,21 +62,14 @@ def _profile_token() -> str:
 
     Two profiles sharing one Tenki account must get distinct sandbox
     names/metadata so they can never attach to or restore each other's
-    sandbox. Prefer the canonical ``HERMES_PROFILE`` id, which is stable across
-    machines and survives a home-directory move; only fall back to a
-    *normalized* ``HERMES_HOME`` path when no profile id is set (the default
-    profile). Resolving per call handles the multiplexing gateway's per-turn
-    ``HERMES_HOME`` override (same reason as :func:`_snapshot_store_path`).
+    sandbox. Delegates to :func:`hermes_constants.active_profile_token`, the
+    single definition shared with the terminal environment cache — output is
+    byte-identical to what this function emitted before, so existing sandbox
+    names and ``hermes_profile`` metadata are unaffected. Resolving per call
+    handles the multiplexing gateway's per-turn ``HERMES_HOME`` override (same
+    reason as :func:`_snapshot_store_path`).
     """
-    profile = os.getenv("HERMES_PROFILE", "").strip()
-    if profile:
-        basis = f"profile:{profile}"
-    else:
-        try:
-            basis = str(get_hermes_home().resolve())
-        except Exception:
-            basis = str(get_hermes_home())
-    return hashlib.sha1(basis.encode("utf-8")).hexdigest()[:10]
+    return active_profile_token()
 
 
 def _load_snapshots(store_path: Path | None = None) -> dict:
@@ -493,9 +485,7 @@ class TenkiEnvironment(BaseEnvironment):
                     logger.warning(
                         "Tenki: forwarding the control-plane credential %s into the "
                         "sandbox as requested by terminal.tenki_forward_env. Guest code "
-                        "can read it and create/terminate/bill account resources. Note "
-                        "that forwarded credentials are NOT profile-isolated under the "
-                        "multiplexing gateway's shared terminal cache.",
+                        "can read it and create/terminate/bill account resources.",
                         key,
                     )
         return env

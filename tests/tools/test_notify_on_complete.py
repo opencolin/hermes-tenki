@@ -497,8 +497,8 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool_module, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
-    monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
-    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    monkeypatch.setitem(terminal_tool_module._active_environments, terminal_tool_module._env_cache_key(None), dummy_env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, terminal_tool_module._env_cache_key(None), 0.0)
     return terminal_tool_module
 
 
@@ -514,8 +514,8 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     assert result["session_id"] == "proc_silent_test"
     hint = result.get("hint", "")
@@ -540,8 +540,8 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     assert "hint" not in result, (
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
@@ -561,8 +561,8 @@ def test_background_with_watch_patterns_does_not_emit_hint(monkeypatch, tmp_path
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     assert "hint" not in result, (
         f"watch_patterns shape must not emit a silent-process hint, got: {result.get('hint')!r}"
@@ -582,7 +582,7 @@ def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):
         env={},
         execute=lambda *a, **kw: {"output": "done", "exit_code": 0, "error": None},
     )
-    monkeypatch.setitem(tt._active_environments, "default", dummy_env)
+    monkeypatch.setitem(tt._active_environments, tt._env_cache_key(None), dummy_env)
 
     try:
         result = json.loads(
@@ -592,8 +592,8 @@ def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     assert "hint" not in result, (
         f"Foreground commands must not emit the background-silence hint, got: {result.get('hint')!r}"
@@ -633,8 +633,8 @@ def test_homebrew_ci_poller_via_statusCheckRollup_emits_hint(monkeypatch, tmp_pa
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     hint = result.get("hint", "")
     assert hint, "Homebrew CI poller must emit a hint pointing at green-ci-policy"
@@ -665,8 +665,8 @@ def test_homebrew_ci_poller_via_gh_pr_checks_piped_to_jq_emits_hint(monkeypatch,
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     hint = result.get("hint", "")
     assert hint, "Homebrew `gh pr checks | jq` poller must emit a hint"
@@ -697,8 +697,8 @@ def test_canonical_column2_awk_poller_does_not_emit_homebrew_hint(monkeypatch, t
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     assert "hint" not in result, (
         f"Canonical column-2 awk poller must not be flagged as homebrew, got: {result.get('hint')!r}"
@@ -724,8 +724,8 @@ def test_canonical_gh_pr_checks_exit_code_loop_does_not_emit_hint(monkeypatch, t
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     # No silent-process hint (we have notify_on_complete) AND no
     # homebrew-poller hint (no jq / awk pipeline parsing stdout).
@@ -748,8 +748,8 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
             )
         )
     finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+        tt._active_environments.pop(tt._env_cache_key(None), None)
+        tt._last_activity.pop(tt._env_cache_key(None), None)
 
     assert "hint" not in result, (
         f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"

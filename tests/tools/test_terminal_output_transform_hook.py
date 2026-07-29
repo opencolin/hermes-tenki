@@ -49,8 +49,9 @@ def _run_terminal(
         "_check_all_guards",
         lambda *_args, **_kwargs: approval or {"approved": True},
     )
-    monkeypatch.setitem(terminal_tool_module._active_environments, "default", mock_env)
-    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    cache_key = terminal_tool_module._env_cache_key(None)
+    monkeypatch.setitem(terminal_tool_module._active_environments, cache_key, mock_env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, cache_key, 0.0)
 
     if invoke_hook is not _UNSET:
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
@@ -172,8 +173,9 @@ def test_large_process_output_is_bounded_before_sudo_and_plugin_hooks(
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _hook_spy)
 
     env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
-    monkeypatch.setitem(terminal_tool_module._active_environments, "default", env)
-    monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    cache_key = terminal_tool_module._env_cache_key(None)
+    monkeypatch.setitem(terminal_tool_module._active_environments, cache_key, env)
+    monkeypatch.setitem(terminal_tool_module._last_activity, cache_key, 0.0)
     try:
         command = (
             "python3 -c \"import sys; "
