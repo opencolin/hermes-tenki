@@ -1598,12 +1598,12 @@ def run_doctor(args):
             )
 
         if importlib.util.find_spec("tenki_sandbox") is not None:
-            check_ok("tenki-sandbox SDK", "(installed)")
+            check_ok("tenki SDK", "(installed)")
         else:
             _fail_and_issue(
-                "tenki-sandbox SDK not installed",
-                "(pip install tenki-sandbox==0.4.0)",
-                "Install Tenki SDK: pip install tenki-sandbox==0.4.0",
+                "tenki SDK not installed",
+                "(pip install 'tenki>=1.4.1,<2')",
+                "Install Tenki SDK: pip install 'tenki>=1.4.1,<2'",
                 issues,
             )
 
