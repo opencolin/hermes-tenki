@@ -311,7 +311,7 @@ terminal:
 # OPTION 7: Tenki cloud execution
 # Commands run in Tenki cloud sandboxes, created on demand
 # Great for: On-demand cloud compute, isolated ephemeral sandboxes
-# Requires: pip install tenki-sandbox, plus `tenki login` or the
+# Requires: pip install 'tenki>=1.4.1,<2' (the SDK; it provides the tenki_sandbox module), plus `tenki login` or the
 #           TENKI_AUTH_TOKEN / TENKI_API_KEY env var
 # -----------------------------------------------------------------------------
 # terminal:

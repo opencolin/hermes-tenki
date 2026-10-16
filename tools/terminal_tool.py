@@ -3034,15 +3034,15 @@ def check_terminal_requirements() -> bool:
                     importlib.invalidate_caches()
                 except Exception as exc:
                     logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1 (%s)",
+                        "the tenki SDK is required for the Tenki terminal backend: "
+                        "pip install 'tenki>=1.4.1,<2' (%s)",
                         exc,
                     )
                     return False
                 if importlib.util.find_spec("tenki_sandbox") is None:
                     logger.error(
-                        "tenki-sandbox is required for Tenki terminal backend: "
-                        "pip install tenki-sandbox==0.1.1"
+                        "the tenki SDK is required for the Tenki terminal backend: "
+                        "pip install 'tenki>=1.4.1,<2'"
                     )
                     return False
             try:

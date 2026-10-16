@@ -1399,7 +1399,7 @@ def setup_terminal_backend(config: dict):
             import subprocess
 
             uv_bin = shutil.which("uv")
-            package = "tenki-sandbox==0.4.0"
+            package = "tenki>=1.4.1,<2"
             if uv_bin:
                 result = subprocess.run(
                     [uv_bin, "pip", "install", "--python", sys.executable, package],
@@ -1415,7 +1415,7 @@ def setup_terminal_backend(config: dict):
             if result.returncode == 0:
                 print_success("Tenki SDK installed")
             else:
-                print_warning("Install failed — run manually: pip install tenki-sandbox==0.4.0")
+                print_warning("Install failed — run manually: pip install 'tenki>=1.4.1,<2'")
                 if result.stderr:
                     print_info(f"  Error: {result.stderr.strip().splitlines()[-1]}")
 
